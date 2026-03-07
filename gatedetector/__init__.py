@@ -1,0 +1,1 @@
+# GateDetector core library

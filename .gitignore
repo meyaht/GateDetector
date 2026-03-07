@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.npy
+*.e57
+*.pts
+*.xyz
+*.ply
+*.dxf
+gates.json
+*.log
+.env
