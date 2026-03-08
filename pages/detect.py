@@ -509,7 +509,7 @@ def update_slice(slice_clicks, detect_clicks, axis, pos, thick, store):
                 f"Too few points in slab ({len(uv)}). Adjust position or increase thickness.",
                 color="warning")
         else:
-            new_gates = detect_gates(uv, axis_up, pos_m, thick_m, pts_slab)
+            new_gates = detect_gates(uv, axis_up, pos_m, thick_m, pts_slab_rot)
             for g in new_gates:
                 cache.add_gate(g.to_dict())
             gates = cache.get_gates()
