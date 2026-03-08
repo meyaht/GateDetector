@@ -20,6 +20,8 @@ import json
 import csv
 import io
 import uuid
+import threading
+from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
@@ -31,7 +33,7 @@ import cache
 from gatedetector.slab import extract_slab, plan_projection, cloud_bounds
 from gatedetector.detect import detect_gates, Gate
 
-dash.register_page(__name__, path="/detect", title="GateDetector — Detect")
+dash.register_page(__name__, path="/", title="GateDetector")
 
 
 # ---------------------------------------------------------------------------
@@ -68,11 +70,46 @@ def _empty_slice() -> go.Figure:
     return fig
 
 
+def _rotate_pts(pts: np.ndarray, deg: float) -> np.ndarray:
+    """Return pts with X,Y rotated by deg degrees (Z unchanged).
+    When deg==0 returns original array (no copy). Otherwise only
+    allocates the two rotated columns to avoid a full 3-column copy."""
+    if deg == 0:
+        return pts
+    r = np.deg2rad(deg)
+    c, s = np.cos(r), np.sin(r)
+    x, y = pts[:, 0], pts[:, 1]
+    out = np.empty_like(pts)
+    out[:, 0] = x * c - y * s
+    out[:, 1] = x * s + y * c
+    out[:, 2] = pts[:, 2]
+    return out
+
+
+def _slab_mask(pts: np.ndarray, axis: str, position_m: float,
+               thick_m: float, deg: float) -> np.ndarray:
+    """Return boolean mask for slab membership after rotation,
+    without rotating all 3 columns of the full cloud."""
+    half = thick_m / 2
+    if deg == 0:
+        col = 1 if axis.upper() == "Y" else 0
+        return np.abs(pts[:, col] - position_m) <= half
+    r = np.deg2rad(deg)
+    c, s = np.cos(r), np.sin(r)
+    if axis.upper() == "Y":
+        rot_coord = pts[:, 0] * s + pts[:, 1] * c   # rotated Y
+    else:
+        rot_coord = pts[:, 0] * c - pts[:, 1] * s   # rotated X
+    return np.abs(rot_coord - position_m) <= half
+
+
 def _plan_fig(pts: np.ndarray, axis: str, position_m: float,
               bn: dict, gates: list[dict]) -> go.Figure:
+    """pts should already be rotated before calling."""
     x, y = plan_projection(pts, n_max=75_000)
+
     fig = go.Figure(go.Scatter(
-        x=x, y=y, mode="markers",
+        x=x.tolist(), y=y.tolist(), mode="markers",
         marker=dict(size=1, color="#3498db", opacity=0.35),
         hovertemplate="X:%{x:.2f} Y:%{y:.2f}<extra></extra>",
         name="Cloud",
@@ -102,8 +139,8 @@ def _plan_fig(pts: np.ndarray, axis: str, position_m: float,
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(10,10,20,1)",
-        xaxis=dict(title="X (m)", color="#aaa", range=[bn["xmin"], bn["xmax"]]),
-        yaxis=dict(title="Y (m)", color="#aaa", scaleanchor="x",
+        xaxis=dict(title="X′ (m)", color="#aaa", range=[bn["xmin"], bn["xmax"]]),
+        yaxis=dict(title="Y′ (m)", color="#aaa", scaleanchor="x",
                    range=[bn["ymin"], bn["ymax"]]),
         margin=dict(l=40, r=10, t=10, b=40),
         showlegend=False,
@@ -208,7 +245,29 @@ def _build_table(gates: list[dict]) -> html.Div:
 # Layout — defined AFTER helpers
 # ---------------------------------------------------------------------------
 
+_SUPPORTED = ".npy  |  .e57  |  .pts  |  .xyz"
+
 layout = dbc.Container(fluid=True, children=[
+
+    # ---- Load section ---------------------------------------------------
+    dbc.Card(className="mb-3 mt-3", body=True, children=[
+        dbc.Row([
+            dbc.Col(dbc.Input(
+                id="load-path-input",
+                placeholder="Paste path to point cloud (.npy / .e57 / .pts) or click Browse…",
+                debounce=False,
+                className="font-monospace small",
+            ), md=6),
+            dbc.Col(dbc.Button("Browse…", id="browse-btn", color="secondary",
+                               outline=True, size="sm", className="w-100"), md=1),
+            dbc.Col(dbc.Button("Load",    id="load-btn",   color="primary",
+                               size="sm", className="w-100"), md=1),
+            dbc.Col(dbc.Button("Clear",   id="clear-btn",  color="secondary",
+                               outline=True, size="sm", className="w-100"), md=1),
+            dbc.Col(html.Div(id="load-status", className="small d-flex align-items-center"), md=3),
+        ], className="g-2 align-items-center"),
+        dcc.Interval(id="load-poll", interval=400, n_intervals=0, disabled=True),
+    ]),
 
     # ---- Controls bar ---------------------------------------------------
     dbc.Card(className="mb-3 mt-3", body=True, children=[
@@ -260,6 +319,21 @@ layout = dbc.Container(fluid=True, children=[
             ], md=3),
         ], className="g-2 align-items-end"),
     ]),
+
+    # ---- Plan rotation controls -----------------------------------------
+    dbc.Row([
+        dbc.Col(html.Span("Plan rotation:", className="small text-muted"), width="auto",
+                className="d-flex align-items-center"),
+        dbc.Col(dbc.ButtonGroup([
+            dbc.Button("−5°", id="rot-m5-btn",    color="secondary", outline=True, size="sm"),
+            dbc.Button("−1°", id="rot-m1-btn",    color="secondary", outline=True, size="sm"),
+            dbc.Button("0°",  id="rot-reset-btn", color="secondary", outline=True, size="sm"),
+            dbc.Button("+1°", id="rot-p1-btn",    color="secondary", outline=True, size="sm"),
+            dbc.Button("+5°", id="rot-p5-btn",    color="secondary", outline=True, size="sm"),
+        ]), width="auto"),
+        dbc.Col(html.Span(id="rot-display", className="small text-info ms-2"), width="auto",
+                className="d-flex align-items-center"),
+    ], className="g-2 mb-3 align-items-center"),
 
     # ---- Dual view -------------------------------------------------------
     dbc.Row([
@@ -326,6 +400,35 @@ layout = dbc.Container(fluid=True, children=[
 
 
 # ---------------------------------------------------------------------------
+# Rotation buttons → update store
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("store",       "data",    allow_duplicate=True),
+    Output("rot-display", "children"),
+    Input("rot-m5-btn",   "n_clicks"),
+    Input("rot-m1-btn",   "n_clicks"),
+    Input("rot-reset-btn","n_clicks"),
+    Input("rot-p1-btn",   "n_clicks"),
+    Input("rot-p5-btn",   "n_clicks"),
+    State("store",        "data"),
+    prevent_initial_call=True,
+)
+def update_rotation(m5, m1, reset, p1, p5, store):
+    store = store or {}
+    deg = float(store.get("plan_rotation", 0))
+    tid = ctx.triggered_id
+    if tid == "rot-m5-btn":    deg -= 5
+    elif tid == "rot-m1-btn":  deg -= 1
+    elif tid == "rot-reset-btn": deg = 0
+    elif tid == "rot-p1-btn":  deg += 1
+    elif tid == "rot-p5-btn":  deg += 5
+    deg = round(deg % 360, 1)
+    store["plan_rotation"] = deg
+    return store, f"{deg}°"
+
+
+# ---------------------------------------------------------------------------
 # Step buttons → update position input
 # ---------------------------------------------------------------------------
 
@@ -353,6 +456,7 @@ def update_position(b10, b1, f1, f10, click, pos, step, axis):
 
     if triggered == "plan-graph" and click:
         pt = click["points"][0]
+        # Coords are already in rotated space — use directly
         return round(pt["y"] if (axis or "Y").upper() == "Y" else pt["x"], 2)
 
     return pos
@@ -373,21 +477,30 @@ def update_position(b10, b1, f1, f10, click, pos, step, axis):
     State("axis-radio",     "value"),
     State("pos-input",      "value"),
     State("thick-input",    "value"),
+    State("store",          "data"),
     prevent_initial_call=True,
 )
-def update_slice(slice_clicks, detect_clicks, axis, pos, thick):
+def update_slice(slice_clicks, detect_clicks, axis, pos, thick, store):
     pts = cache.get_cloud()
     if pts is None or len(pts) == 0:
-        msg = dbc.Alert("No cloud loaded. Go to Load page first.", color="warning")
+        msg = dbc.Alert("No cloud loaded. Use the Load bar above.", color="warning")
         return _empty_plan(), _empty_slice(), "Cross-section", msg, dash.no_update
 
-    axis_up = (axis or "Y").upper()
-    pos_m   = float(pos   or 0.0)
-    thick_m = float(thick or 0.4)
-    bn = cloud_bounds(pts)
-    triggered = ctx.triggered_id
+    axis_up  = (axis or "Y").upper()
+    pos_m    = float(pos   or 0.0)
+    thick_m  = float(thick or 0.4)
+    rot_deg  = float((store or {}).get("plan_rotation", 0))
 
-    pts_slab, uv, u_label, v_label = extract_slab(pts, axis_up, pos_m, thick_m)
+    # For plan view subsample: rotate only the 75k display points
+    sub_idx = np.random.default_rng(0).choice(len(pts), min(75_000, len(pts)), replace=False, shuffle=False)
+    pts_sub = _rotate_pts(pts[sub_idx], rot_deg)
+    bn = cloud_bounds(_rotate_pts(pts[sub_idx], rot_deg))
+
+    # For slab: use fast mask on original coords, rotate only slab subset
+    triggered = ctx.triggered_id
+    mask = _slab_mask(pts, axis_up, pos_m, thick_m, rot_deg)
+    pts_slab_rot = _rotate_pts(pts[mask], rot_deg)
+    _, uv, u_label, v_label = extract_slab(pts_slab_rot, axis_up, pos_m, thick_m)
     gates = cache.get_gates()
 
     if triggered == "detect-btn":
@@ -406,7 +519,7 @@ def update_slice(slice_clicks, detect_clicks, axis, pos, thick):
     else:
         status = f"{len(uv):,} pts in slab."
 
-    plan  = _plan_fig(pts, axis_up, pos_m, bn, gates)
+    plan  = _plan_fig(pts_sub, axis_up, pos_m, bn, gates)
     slc   = _slice_fig(uv, u_label, v_label, gates, pos_m)
     title = (f"Cross-section  |  axis {axis_up}  @  {pos_m:.2f} m  "
              f"|  thick {thick_m:.2f} m  |  {len(uv):,} pts  "
@@ -420,18 +533,47 @@ def update_slice(slice_clicks, detect_clicks, axis, pos, thick):
 # ---------------------------------------------------------------------------
 
 @callback(
-    Output("plan-graph", "figure",  allow_duplicate=True),
-    Output("pos-input",  "value",   allow_duplicate=True),
-    Input("store",       "data"),
+    Output("plan-graph",  "figure",  allow_duplicate=True),
+    Output("slice-graph", "figure",  allow_duplicate=True),
+    Output("pos-input",   "value",   allow_duplicate=True),
+    Input("store",        "data"),
+    State("pos-input",    "value"),
+    State("axis-radio",   "value"),
+    State("thick-input",  "value"),
     prevent_initial_call="initial_duplicate",
 )
-def init_plan(store):
+def init_plan(store, pos, axis, thick):
     pts = cache.get_cloud()
     if pts is None or len(pts) == 0:
-        return _empty_plan(), dash.no_update
-    bn  = cloud_bounds(pts)
-    mid = round((bn["ymin"] + bn["ymax"]) / 2, 2)
-    return _plan_fig(pts, "Y", mid, bn, cache.get_gates()), mid
+        return _empty_plan(), _empty_slice(), dash.no_update
+
+    rot_deg = float((store or {}).get("plan_rotation", 0))
+    axis_up = (axis or "Y").upper()
+    thick_m = float(thick or 0.4)
+
+    # Rotate only the display subsample for the plan view
+    rng = np.random.default_rng(0)
+    sub_idx = rng.choice(len(pts), min(75_000, len(pts)), replace=False, shuffle=False)
+    pts_sub = _rotate_pts(pts[sub_idx], rot_deg)
+    bn = cloud_bounds(pts_sub)
+
+    if pos is None:
+        pos_m   = round((bn["ymin"] + bn["ymax"]) / 2, 2)
+        new_pos = pos_m
+    else:
+        pos_m   = float(pos)
+        new_pos = dash.no_update
+
+    gates = cache.get_gates()
+    plan  = _plan_fig(pts_sub, axis_up, pos_m, bn, gates)
+
+    # Rotate only the slab subset for the slice view
+    mask = _slab_mask(pts, axis_up, pos_m, thick_m, rot_deg)
+    pts_slab_rot = _rotate_pts(pts[mask], rot_deg)
+    _, uv, u_label, v_label = extract_slab(pts_slab_rot, axis_up, pos_m, thick_m)
+    slc = _slice_fig(uv, u_label, v_label, gates, pos_m)
+
+    return plan, slc, new_pos
 
 
 # ---------------------------------------------------------------------------
@@ -590,3 +732,151 @@ def export_gates(json_n, csv_n):
                f"Exported {len(gates)} gates as CSV."
 
     return dash.no_update, dash.no_update
+
+
+# ---------------------------------------------------------------------------
+# Load section callbacks (merged from load.py)
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("load-path-input", "value"),
+    Input("browse-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def browse_file(_):
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes("-topmost", True)
+    path = filedialog.askopenfilename(
+        title="Select point cloud file",
+        filetypes=[
+            ("Point cloud files", "*.npy *.e57 *.pts *.xyz *.txt"),
+            ("All files", "*.*"),
+        ],
+    )
+    root.destroy()
+    return path or dash.no_update
+
+
+@callback(
+    Output("load-poll",   "disabled"),
+    Output("load-status", "children", allow_duplicate=True),
+    Input("load-btn",     "n_clicks"),
+    State("load-path-input", "value"),
+    prevent_initial_call=True,
+)
+def trigger_load(n_clicks, path):
+    if not path or not path.strip():
+        return True, dbc.Alert("Enter a file path first.", color="warning", className="py-1 mb-0")
+    p = Path(path.strip())
+    if not p.exists():
+        return True, dbc.Alert(f"File not found: {p}", color="danger", className="py-1 mb-0")
+
+    def _load():
+        try:
+            cache.set_status("Starting load…", 0.0)
+            suffix = p.suffix.lower()
+
+            if suffix == ".npy":
+                print(f"[Load] opening: {p} ({p.stat().st_size/1e9:.2f} GB)", flush=True)
+                cache.set_status(f"Opening {p.name}…", 0.05)
+                pts = np.load(str(p), mmap_mode="r")
+                print(f"[Load] mapped: shape={pts.shape} dtype={pts.dtype}", flush=True)
+                if pts.ndim != 2 or pts.shape[1] < 3:
+                    cache.set_status("Error: .npy must be (N, ≥3) array.", 0.0)
+                    return
+                cache.set_status(f"Reading {p.name} into memory…", 0.2)
+                pts = pts[:, :3].astype(np.float32)
+                print(f"[Load] loaded {len(pts):,} points.", flush=True)
+                cache.set_status("Caching…", 0.9)
+                cache.set_cloud(pts)
+                print("[Load] Done.", flush=True)
+
+            elif suffix == ".e57":
+                try:
+                    import sys
+                    sys.path.insert(0, str(Path(__file__).parents[2] / "NeuralPipe-v2"))
+                    from neuralpipe.geometry.voxel_grid import downsample_to_npy
+                except ImportError:
+                    cache.set_status("Error: pye57 / NeuralPipe not found. Pre-downsample to .npy.", 0.0)
+                    return
+                out_npy = p.parent / (p.stem + "_15mm.npy")
+                pts = downsample_to_npy(p, out_npy, cell_size_m=0.015,
+                                        progress_callback=lambda m: cache.set_status(m, -1))
+                cache.set_cloud(pts)
+
+            elif suffix in (".pts", ".xyz", ".txt"):
+                try:
+                    import sys
+                    sys.path.insert(0, str(Path(__file__).parents[2] / "NeuralPipe-v2"))
+                    from neuralpipe.geometry.voxel_grid import downsample_to_npy
+                except ImportError:
+                    cache.set_status("Error: NeuralPipe not found. Pre-downsample to .npy.", 0.0)
+                    return
+                out_npy = p.parent / (p.stem + "_15mm.npy")
+                pts = downsample_to_npy(p, out_npy, cell_size_m=0.015,
+                                        progress_callback=lambda m: cache.set_status(m, -1))
+                cache.set_cloud(pts)
+
+            else:
+                cache.set_status(f"Unsupported format. Use: {_SUPPORTED}", 0.0)
+                return
+
+            n = len(cache.get_cloud())
+            cache.set_status(f"READY:{n}", 1.0)
+
+        except Exception as e:
+            cache.set_status(f"Error: {e}", 0.0)
+
+    threading.Thread(target=_load, daemon=True).start()
+    return False, html.Span("Loading…", className="text-info small")
+
+
+@callback(
+    Output("load-poll",   "disabled",  allow_duplicate=True),
+    Output("load-status", "children",  allow_duplicate=True),
+    Output("store",       "data",      allow_duplicate=True),
+    Input("load-poll",    "n_intervals"),
+    State("store",        "data"),
+    prevent_initial_call=True,
+)
+def poll_load(n, store):
+    msg, progress = cache.get_status()
+    print(f"[Poll] msg={msg!r} progress={progress}", flush=True)
+    store = store or {}
+
+    if not msg.startswith("READY:"):
+        return False, html.Span(msg or "Idle.", className="text-info small"), dash.no_update
+
+    try:
+        n_pts = int(msg.split(":", 1)[1])
+        pts = cache.get_cloud()
+        bn = cloud_bounds(pts) if pts is not None and len(pts) > 0 else {}
+        store.update(
+            cloud_bmin=[bn.get("xmin", 0), bn.get("ymin", 0), bn.get("zmin", 0)],
+            cloud_bmax=[bn.get("xmax", 0), bn.get("ymax", 0), bn.get("zmax", 0)],
+        )
+        status = dbc.Alert(
+            f"{n_pts:,} pts loaded.",
+            color="success", className="py-1 mb-0 small",
+        )
+        print(f"[Poll] READY — disabling interval, n_pts={n_pts:,}", flush=True)
+        return True, status, store
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return True, dbc.Alert(f"Load error: {e}", color="danger", className="py-1 mb-0"), dash.no_update
+
+
+@callback(
+    Output("load-status", "children",  allow_duplicate=True),
+    Input("clear-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def clear_cloud(_):
+    cache.set_cloud(np.zeros((0, 3), dtype=np.float32))
+    cache.set_status("", 0.0)
+    return html.Span("Cloud cleared.", className="text-muted small")

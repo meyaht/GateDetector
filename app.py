@@ -20,10 +20,7 @@ _nav = dbc.NavbarSimple(
     color="dark",
     dark=True,
     className="mb-0 px-3",
-    children=[
-        dbc.NavItem(dbc.NavLink("Load",   href="/",       active="exact")),
-        dbc.NavItem(dbc.NavLink("Detect", href="/detect", active="exact")),
-    ],
+    children=[],
 )
 
 app.layout = html.Div([
@@ -37,4 +34,4 @@ app.layout = html.Div([
 
 if __name__ == "__main__":
     threading.Timer(1.5, lambda: webbrowser.open("http://localhost:8051")).start()
-    app.run(debug=True, port=8051, use_reloader=False)
+    app.run(debug=False, port=8051)

@@ -24,7 +24,7 @@ GATES_FILE = Path(__file__).parent / "gates.json"
 
 def set_cloud(pts: np.ndarray) -> None:
     global _cloud
-    _cloud = pts.astype(np.float32)
+    _cloud = pts if pts.dtype == np.float32 else pts.astype(np.float32)
 
 
 def get_cloud() -> Optional[np.ndarray]:
