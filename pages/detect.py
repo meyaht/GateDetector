@@ -261,13 +261,19 @@ layout = dbc.Container(fluid=True, children=[
             ), md=6),
             dbc.Col(dbc.Button("Browse…", id="browse-btn", color="secondary",
                                outline=True, size="sm", className="w-100"), md=1),
-            dbc.Col(dbc.Button("Load",    id="load-btn",   color="primary",
-                               size="sm", className="w-100"), md=1),
+            dbc.Col([
+                dbc.Button("Load", id="load-btn", color="primary",
+                           size="sm", className="w-100"),
+                html.Div(id="load-timer-display",
+                         className="text-center mt-1",
+                         style={"fontSize": "0.75rem"}),
+            ], md=1),
             dbc.Col(dbc.Button("Clear",   id="clear-btn",  color="secondary",
                                outline=True, size="sm", className="w-100"), md=1),
             dbc.Col(html.Div(id="load-status", className="small d-flex align-items-center"), md=3),
         ], className="g-2 align-items-center"),
-        dcc.Interval(id="load-poll", interval=400, n_intervals=0, disabled=True),
+        dcc.Interval(id="load-poll",     interval=400,  n_intervals=0, disabled=True),
+        dcc.Interval(id="timer-interval", interval=1000, n_intervals=0, disabled=True),
         dcc.Store(id="load-start-store"),
     ]),
 
@@ -766,16 +772,17 @@ def browse_file(_):
     Output("load-poll",        "disabled"),
     Output("load-status",      "children", allow_duplicate=True),
     Output("load-start-store", "data"),
+    Output("timer-interval",   "disabled"),
     Input("load-btn",          "n_clicks"),
     State("load-path-input",   "value"),
     prevent_initial_call=True,
 )
 def trigger_load(n_clicks, path):
     if not path or not path.strip():
-        return True, dbc.Alert("Enter a file path first.", color="warning", className="py-1 mb-0"), dash.no_update
+        return True, dbc.Alert("Enter a file path first.", color="warning", className="py-1 mb-0"), dash.no_update, True
     p = Path(path.strip())
     if not p.exists():
-        return True, dbc.Alert(f"File not found: {p}", color="danger", className="py-1 mb-0"), dash.no_update
+        return True, dbc.Alert(f"File not found: {p}", color="danger", className="py-1 mb-0"), dash.no_update, True
 
     def _load():
         try:
@@ -834,32 +841,26 @@ def trigger_load(n_clicks, path):
             cache.set_status(f"Error: {e}", 0.0)
 
     threading.Thread(target=_load, daemon=True).start()
-    return False, html.Span("Loading…", className="text-info small"), time.time()
+    return False, html.Span("Loading…", className="text-info small"), time.time(), False
 
 
 @callback(
-    Output("load-poll",   "disabled",  allow_duplicate=True),
-    Output("load-status", "children",  allow_duplicate=True),
-    Output("store",       "data",      allow_duplicate=True),
-    Input("load-poll",    "n_intervals"),
-    State("store",        "data"),
-    State("load-start-store", "data"),
+    Output("load-poll",      "disabled",  allow_duplicate=True),
+    Output("load-status",    "children",  allow_duplicate=True),
+    Output("store",          "data",      allow_duplicate=True),
+    Output("timer-interval", "disabled",  allow_duplicate=True),
+    Output("load-timer-display", "children", allow_duplicate=True),
+    Input("load-poll",       "n_intervals"),
+    State("store",           "data"),
     prevent_initial_call=True,
 )
-def poll_load(n, store, start_time):
+def poll_load(n, store):
     msg, progress = cache.get_status()
     print(f"[Poll] msg={msg!r} progress={progress}", flush=True)
     store = store or {}
 
     if not msg.startswith("READY:"):
-        elapsed = time.time() - start_time if start_time else 0
-        mins, secs = int(elapsed // 60), int(elapsed % 60)
-        color = "danger" if elapsed > 180 else "info"
-        status = html.Span(
-            f"{msg or 'Loading…'}  {mins}:{secs:02d}",
-            className=f"text-{color} small",
-        )
-        return False, status, dash.no_update
+        return False, html.Span(msg or "Loading…", className="text-info small"), dash.no_update, dash.no_update, dash.no_update
 
     try:
         n_pts = int(msg.split(":", 1)[1])
@@ -874,20 +875,39 @@ def poll_load(n, store, start_time):
             color="success", className="py-1 mb-0 small",
         )
         print(f"[Poll] READY — disabling interval, n_pts={n_pts:,}", flush=True)
-        return True, status, store
+        return True, status, store, True, ""
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return True, dbc.Alert(f"Load error: {e}", color="danger", className="py-1 mb-0"), dash.no_update
+        return True, dbc.Alert(f"Load error: {e}", color="danger", className="py-1 mb-0"), dash.no_update, True, ""
 
 
 @callback(
-    Output("load-status", "children",  allow_duplicate=True),
+    Output("load-status",        "children",  allow_duplicate=True),
+    Output("timer-interval",     "disabled",  allow_duplicate=True),
+    Output("load-timer-display", "children",  allow_duplicate=True),
     Input("clear-btn", "n_clicks"),
     prevent_initial_call=True,
 )
 def clear_cloud(_):
     cache.set_cloud(np.zeros((0, 3), dtype=np.float32))
     cache.set_status("", 0.0)
-    return html.Span("Cloud cleared.", className="text-muted small")
+    return html.Span("Cloud cleared.", className="text-muted small"), True, ""
+
+
+@callback(
+    Output("load-timer-display", "children", allow_duplicate=True),
+    Output("load-timer-display", "style"),
+    Input("timer-interval",      "n_intervals"),
+    State("load-start-store",    "data"),
+    prevent_initial_call=True,
+)
+def update_timer(n, start_time):
+    if not start_time:
+        return "", {}
+    elapsed = time.time() - start_time
+    mins = int(elapsed // 60)
+    secs = int(elapsed % 60)
+    color = "#e74c3c" if elapsed > 180 else "#aaaaaa"
+    return f"{mins}:{secs:02d}", {"fontSize": "0.75rem", "color": color}
