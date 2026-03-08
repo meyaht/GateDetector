@@ -517,12 +517,14 @@ def update_slice(slice_clicks, detect_clicks, axis, pos, thick, store):
                 f"Too few points in slab ({len(uv)}). Adjust position or increase thickness.",
                 color="warning")
         else:
-            new_gates = detect_gates(uv, axis_up, pos_m, thick_m, pts_slab_rot)
+            new_gates, debug_str = detect_gates(uv, axis_up, pos_m, thick_m, pts_slab_rot)
             for g in new_gates:
                 cache.add_gate(g.to_dict())
             gates = cache.get_gates()
             status = dbc.Alert(
-                f"Detected {len(new_gates)} gate(s) in slab  |  {len(uv):,} pts sampled.",
+                [f"Detected {len(new_gates)} gate(s) in slab  |  {len(uv):,} pts sampled.",
+                 html.Br(),
+                 html.Span(debug_str, className="text-muted small")],
                 color="success", className="py-1")
     else:
         status = f"{len(uv):,} pts in slab."

@@ -462,10 +462,15 @@ def detect_gates(
     min_gate_h: float = 0.3,
     max_gate_h: float = 6.0,
     min_beam_fill: float = 0.20,   # retained in signature for compatibility, unused in v2
-) -> list[Gate]:
-    """Detect pipe rack gates in a 2D cross-section slice (v2 algorithm)."""
+) -> tuple[list[Gate], str]:
+    """Detect pipe rack gates in a 2D cross-section slice (v2 algorithm).
+
+    Returns:
+        gates:      list of Gate objects
+        debug_str:  human-readable summary of intermediate counts for UI display
+    """
     if len(uv) < 10:
-        return []
+        return [], "Too few points."
 
     grid, u_origin, u_end, v_origin, v_end = _rasterize(uv, cell_m)
 
@@ -478,7 +483,7 @@ def detect_gates(
     v_bands = _find_v_bands(grid, max_gap_cells=20, min_run_cells=10, merge_col_gap=4)
 
     if not h_bands:
-        return []
+        return [], f"0 h-bands found (grid {grid.shape[1]}×{grid.shape[0]} cells)."
 
     rects = _find_gate_rects_v2(
         h_bands, v_bands, cell_m,
@@ -537,4 +542,12 @@ def detect_gates(
         gates.append(g)
 
     gates.sort(key=lambda g: (-g.confidence, -g.pipe_count))
-    return gates
+
+    debug_str = (
+        f"{len(h_bands)} h-bands, {len(v_bands)} v-bands  →  "
+        f"{len(rects)} candidates  →  {len(gates)} gates  "
+        f"(grid {grid.shape[1]}×{grid.shape[0]} cells, "
+        f"size limits W {min_gate_w}–{max_gate_w} m, H {min_gate_h}–{max_gate_h} m)"
+    )
+    print(f"[Detect] {debug_str}", flush=True)
+    return gates, debug_str
