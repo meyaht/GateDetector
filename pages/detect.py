@@ -21,6 +21,7 @@ import csv
 import io
 import uuid
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -267,6 +268,7 @@ layout = dbc.Container(fluid=True, children=[
             dbc.Col(html.Div(id="load-status", className="small d-flex align-items-center"), md=3),
         ], className="g-2 align-items-center"),
         dcc.Interval(id="load-poll", interval=400, n_intervals=0, disabled=True),
+        dcc.Store(id="load-start-store"),
     ]),
 
     # ---- Controls bar ---------------------------------------------------
@@ -761,18 +763,19 @@ def browse_file(_):
 
 
 @callback(
-    Output("load-poll",   "disabled"),
-    Output("load-status", "children", allow_duplicate=True),
-    Input("load-btn",     "n_clicks"),
-    State("load-path-input", "value"),
+    Output("load-poll",        "disabled"),
+    Output("load-status",      "children", allow_duplicate=True),
+    Output("load-start-store", "data"),
+    Input("load-btn",          "n_clicks"),
+    State("load-path-input",   "value"),
     prevent_initial_call=True,
 )
 def trigger_load(n_clicks, path):
     if not path or not path.strip():
-        return True, dbc.Alert("Enter a file path first.", color="warning", className="py-1 mb-0")
+        return True, dbc.Alert("Enter a file path first.", color="warning", className="py-1 mb-0"), dash.no_update
     p = Path(path.strip())
     if not p.exists():
-        return True, dbc.Alert(f"File not found: {p}", color="danger", className="py-1 mb-0")
+        return True, dbc.Alert(f"File not found: {p}", color="danger", className="py-1 mb-0"), dash.no_update
 
     def _load():
         try:
@@ -830,7 +833,7 @@ def trigger_load(n_clicks, path):
             cache.set_status(f"Error: {e}", 0.0)
 
     threading.Thread(target=_load, daemon=True).start()
-    return False, html.Span("Loading…", className="text-info small")
+    return False, html.Span("Loading…", className="text-info small"), time.time()
 
 
 @callback(
@@ -839,15 +842,23 @@ def trigger_load(n_clicks, path):
     Output("store",       "data",      allow_duplicate=True),
     Input("load-poll",    "n_intervals"),
     State("store",        "data"),
+    State("load-start-store", "data"),
     prevent_initial_call=True,
 )
-def poll_load(n, store):
+def poll_load(n, store, start_time):
     msg, progress = cache.get_status()
     print(f"[Poll] msg={msg!r} progress={progress}", flush=True)
     store = store or {}
 
     if not msg.startswith("READY:"):
-        return False, html.Span(msg or "Idle.", className="text-info small"), dash.no_update
+        elapsed = time.time() - start_time if start_time else 0
+        mins, secs = int(elapsed // 60), int(elapsed % 60)
+        color = "danger" if elapsed > 180 else "info"
+        status = html.Span(
+            f"{msg or 'Loading…'}  {mins}:{secs:02d}",
+            className=f"text-{color} small",
+        )
+        return False, status, dash.no_update
 
     try:
         n_pts = int(msg.split(":", 1)[1])
