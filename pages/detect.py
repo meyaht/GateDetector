@@ -790,8 +790,9 @@ def trigger_load(n_clicks, path):
                 if pts.ndim != 2 or pts.shape[1] < 3:
                     cache.set_status("Error: .npy must be (N, ≥3) array.", 0.0)
                     return
-                cache.set_status("Converting…", 0.8)
-                pts = pts[:, :3].astype(np.float32)
+                if pts.dtype != np.float32 or pts.shape[1] != 3:
+                    cache.set_status("Converting…", 0.8)
+                pts = pts[:, :3].astype(np.float32, copy=False)
                 cache.set_status("Caching…", 0.9)
                 cache.set_cloud(pts)
                 print("[Load] Done.", flush=True)
