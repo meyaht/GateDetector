@@ -1,14 +1,17 @@
 """Gate detection algorithms — pure numpy + scipy, no external CV libraries.
 
-Detection pipeline
-------------------
+Detection pipeline (v2 — local segment detection)
+--------------------------------------------------
 1. Rasterize 2D point slice to binary occupancy grid (30 mm cells by default).
-2. Compute row-sum and column-sum projections to find dense linear spans (steel beams).
-3. Pair horizontal beam spans (top + bottom) with overlapping vertical beam spans
-   (left + right) to form rectangular gate candidates.
-4. Within each candidate rectangle, count circular pipe cross-sections using
-   connected-component analysis and circularity filtering.
-5. Score by: side completeness, pipe count, opening area.
+2. Per-row gap-filling (tolerates LiDAR blind spots up to ~0.6 m).
+3. Per-row run detection: find horizontal runs >= 0.3 m, anywhere in the row.
+4. Group nearby beam rows into horizontal bands.
+5. Same column-wise for vertical bands.
+6. Pair top+bottom h_bands within gate size limits to form opening candidates.
+7. Look for matching v_bands on left/right sides; assign confidence by confirmed sides.
+8. Count pipe cross-sections inside each candidate (unchanged from v1).
+
+v1 code (global row/column projection) is commented out below for reference.
 """
 from __future__ import annotations
 
@@ -49,7 +52,7 @@ class Gate:
 
 
 # ---------------------------------------------------------------------------
-# Rasterisation helpers
+# Rasterisation helpers (shared by v1 and v2)
 # ---------------------------------------------------------------------------
 
 def _rasterize(
@@ -69,7 +72,6 @@ def _rasterize(
     u_min, v_min = uv.min(axis=0)
     u_max, v_max = uv.max(axis=0)
 
-    # Add a small border
     border = cell_m * 2
     u0 = u_min - border
     v0 = v_min - border
@@ -83,7 +85,6 @@ def _rasterize(
     grid = np.zeros((n_v, n_u), dtype=bool)
     grid[vi, ui] = True
 
-    # Dilate to connect nearby points (handles slight gaps in beam surfaces)
     struct = np.ones((3, 3), dtype=bool)
     grid = binary_dilation(grid, structure=struct, iterations=2)
 
@@ -95,67 +96,131 @@ def _grid_to_world(idx: int, origin: float, cell_m: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Linear feature (beam) detection
+# v2: Local segment detection (gap-tolerant)
 # ---------------------------------------------------------------------------
 
-def _find_dense_spans(
-    projection: np.ndarray,
-    grid_size: int,
-    min_fill_fraction: float = 0.20,
-    min_span_cells: int = 3,
-    merge_gap_cells: int = 4,
-) -> list[tuple[int, int]]:
-    """Given a 1D occupancy projection (sum of a 2D grid along one axis),
-    find contiguous spans where fill fraction exceeds the threshold.
+def _fill_gaps_1d(arr: np.ndarray, max_gap: int) -> np.ndarray:
+    """Fill runs of False up to max_gap cells in a 1D boolean array.
 
-    projection: 1D array — number of occupied cells per row or column
-    grid_size:  the dimension perpendicular to the projection axis (to compute fill)
-    Returns list of (start, end) index pairs (inclusive).
+    Handles LiDAR blind spots: a beam interrupted by a shadow still reads
+    as a single continuous run after filling.
+    Only fills interior gaps (not leading/trailing False regions).
     """
-    norm = projection / max(grid_size, 1)
-    dense = norm >= min_fill_fraction
-
-    spans = []
-    in_span = False
-    start = 0
-    for i, d in enumerate(dense):
-        if d and not in_span:
-            start = i
-            in_span = True
-        elif not d and in_span:
-            if i - start >= min_span_cells:
-                spans.append((start, i - 1))
-            in_span = False
-    if in_span and len(dense) - start >= min_span_cells:
-        spans.append((start, len(dense) - 1))
-
-    # Merge nearby spans
-    if not spans:
-        return []
-    merged = [spans[0]]
-    for s, e in spans[1:]:
-        if s - merged[-1][1] <= merge_gap_cells:
-            merged[-1] = (merged[-1][0], e)
+    out = arr.copy()
+    n = len(out)
+    i = 0
+    while i < n:
+        if not out[i]:
+            j = i
+            while j < n and not out[j]:
+                j += 1
+            # Only fill if gap is bounded on both sides and short enough
+            if j - i <= max_gap and i > 0 and j < n:
+                out[i:j] = True
+            i = max(i + 1, j)
         else:
-            merged.append((s, e))
-    return merged
+            i += 1
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Gate rectangle assembly
-# ---------------------------------------------------------------------------
+def _runs_1d(arr: np.ndarray, min_run: int) -> list[tuple[int, int]]:
+    """Return (start, end) inclusive pairs for True runs of length >= min_run."""
+    runs = []
+    n = len(arr)
+    i = 0
+    while i < n:
+        if arr[i]:
+            j = i + 1
+            while j < n and arr[j]:
+                j += 1
+            if j - i >= min_run:
+                runs.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+    return runs
 
-def _spans_overlap(a: tuple, b: tuple, min_overlap_cells: int = 5) -> bool:
-    """Do two 1D spans overlap by at least min_overlap_cells?"""
-    lo = max(a[0], b[0])
-    hi = min(a[1], b[1])
-    return (hi - lo) >= min_overlap_cells
 
-
-def _find_gate_rects(
-    h_spans: list[tuple[int, int]],    # horizontal beam row spans (V direction)
-    v_spans: list[tuple[int, int]],    # vertical beam col spans (U direction)
+def _find_h_bands(
     grid: np.ndarray,
+    max_gap_cells: int = 20,
+    min_run_cells: int = 10,
+    merge_row_gap: int = 4,
+) -> list[dict]:
+    """Find horizontal beam bands.
+
+    For each row, gap-fill then find horizontal runs of >= min_run_cells.
+    Group rows with runs into bands (consecutive rows within merge_row_gap).
+
+    Returns list of dicts: {row_min, row_max, col_min, col_max}
+    """
+    beam_rows = []
+    for r in range(grid.shape[0]):
+        filled = _fill_gaps_1d(grid[r], max_gap_cells)
+        runs = _runs_1d(filled, min_run_cells)
+        if runs:
+            c0 = min(s for s, _ in runs)
+            c1 = max(e for _, e in runs)
+            beam_rows.append((r, c0, c1))
+
+    if not beam_rows:
+        return []
+
+    bands = []
+    cur = dict(row_min=beam_rows[0][0], row_max=beam_rows[0][0],
+               col_min=beam_rows[0][1], col_max=beam_rows[0][2])
+    for r, c0, c1 in beam_rows[1:]:
+        if r - cur['row_max'] <= merge_row_gap:
+            cur['row_max'] = r
+            cur['col_min'] = min(cur['col_min'], c0)
+            cur['col_max'] = max(cur['col_max'], c1)
+        else:
+            bands.append(cur)
+            cur = dict(row_min=r, row_max=r, col_min=c0, col_max=c1)
+    bands.append(cur)
+    return bands
+
+
+def _find_v_bands(
+    grid: np.ndarray,
+    max_gap_cells: int = 20,
+    min_run_cells: int = 10,
+    merge_col_gap: int = 4,
+) -> list[dict]:
+    """Find vertical beam bands (same logic transposed).
+
+    Returns list of dicts: {col_min, col_max, row_min, row_max}
+    """
+    beam_cols = []
+    for c in range(grid.shape[1]):
+        filled = _fill_gaps_1d(grid[:, c], max_gap_cells)
+        runs = _runs_1d(filled, min_run_cells)
+        if runs:
+            r0 = min(s for s, _ in runs)
+            r1 = max(e for _, e in runs)
+            beam_cols.append((c, r0, r1))
+
+    if not beam_cols:
+        return []
+
+    bands = []
+    cur = dict(col_min=beam_cols[0][0], col_max=beam_cols[0][0],
+               row_min=beam_cols[0][1], row_max=beam_cols[0][2])
+    for c, r0, r1 in beam_cols[1:]:
+        if c - cur['col_max'] <= merge_col_gap:
+            cur['col_max'] = c
+            cur['row_min'] = min(cur['row_min'], r0)
+            cur['row_max'] = max(cur['row_max'], r1)
+        else:
+            bands.append(cur)
+            cur = dict(col_min=c, col_max=c, row_min=r0, row_max=r1)
+    bands.append(cur)
+    return bands
+
+
+def _find_gate_rects_v2(
+    h_bands: list[dict],
+    v_bands: list[dict],
     cell_m: float,
     u_origin: float,
     v_origin: float,
@@ -163,83 +228,170 @@ def _find_gate_rects(
     max_gate_w_cells: int,
     min_gate_h_cells: int,
     max_gate_h_cells: int,
+    v_side_tol_cells: int = 15,    # how close a v_band edge must be to the h overlap edge
+    v_coverage_frac: float = 0.30, # vertical band must cover >= 30% of gate height
 ) -> list[dict]:
-    """Assemble gate rectangles from detected beam spans.
+    """Assemble gate rectangles from horizontal and vertical beam bands.
 
-    Strategy: every pair of horizontal beams (top + bottom) combined with
-    every pair of vertical beams (left + right) that geometrically form
-    a plausible gate rectangle.
+    Every pair of h_bands (bottom + top) whose opening height and overlapping
+    width fall within size limits forms a candidate.  Vertical bands are then
+    searched for matching left/right sides.  Confidence is 0.5 (top+bottom
+    only), 0.75 (three sides), or 1.0 (all four sides).
     """
-    n_rows, n_cols = grid.shape
     candidates = []
 
-    # Pair horizontal beams (top row, bottom row)
-    for i, h1 in enumerate(h_spans):
-        for h2 in h_spans[i + 1:]:
-            # h1 is lower row index (lower V = lower Z typically)
-            bot, top = h1, h2
-            gate_h = top[0] - bot[1]   # gap between the two beams
-            if not (min_gate_h_cells <= gate_h <= max_gate_h_cells):
+    for i, b1 in enumerate(h_bands):
+        for b2 in h_bands[i + 1:]:
+            # Ensure bot < top by row index
+            bot, top = (b1, b2) if b1['row_min'] < b2['row_min'] else (b2, b1)
+
+            gate_h_cells = top['row_min'] - bot['row_max']
+            if not (min_gate_h_cells <= gate_h_cells <= max_gate_h_cells):
                 continue
 
-            # Pair vertical beams that span the gate height
-            for j, v1 in enumerate(v_spans):
-                for v2 in v_spans[j + 1:]:
-                    left, right = v1, v2
-                    gate_w = right[0] - left[1]
-                    if not (min_gate_w_cells <= gate_w <= max_gate_w_cells):
-                        continue
+            # U overlap between top and bottom bands
+            u_lo = max(bot['col_min'], top['col_min'])
+            u_hi = min(bot['col_max'], top['col_max'])
+            gate_w_cells = u_hi - u_lo
+            if not (min_gate_w_cells <= gate_w_cells <= max_gate_w_cells):
+                continue
 
-                    # Check that the vertical beams span the gate height zone
-                    gate_v_range = (bot[0], top[1])
-                    if not (_spans_overlap(left, gate_v_range, min_overlap_cells=3) and
-                            _spans_overlap(right, gate_v_range, min_overlap_cells=3)):
-                        continue
+            v0_c = bot['row_max']
+            v1_c = top['row_min']
 
-                    # Opening bbox in grid coords
-                    u0_c = left[1] + 1
-                    u1_c = right[0] - 1
-                    v0_c = bot[1] + 1
-                    v1_c = top[0] - 1
+            # Find best matching left and right vertical bands
+            left_v = None
+            right_v = None
+            for vb in v_bands:
+                overlap = min(vb['row_max'], v1_c) - max(vb['row_min'], v0_c)
+                if overlap < gate_h_cells * v_coverage_frac:
+                    continue
+                col_center = (vb['col_min'] + vb['col_max']) / 2
+                # Left side
+                if abs(col_center - u_lo) <= v_side_tol_cells:
+                    if left_v is None or abs(col_center - u_lo) < abs(
+                            (left_v['col_min'] + left_v['col_max']) / 2 - u_lo):
+                        left_v = vb
+                # Right side
+                if abs(col_center - u_hi) <= v_side_tol_cells:
+                    if right_v is None or abs(col_center - u_hi) < abs(
+                            (right_v['col_min'] + right_v['col_max']) / 2 - u_hi):
+                        right_v = vb
 
-                    # Convert to world coords (wu/wv prefix avoids shadowing loop vars v1/u0)
-                    wu0 = _grid_to_world(u0_c, u_origin, cell_m)
-                    wu1 = _grid_to_world(u1_c, u_origin, cell_m)
-                    wv0 = _grid_to_world(v0_c, v_origin, cell_m)
-                    wv1 = _grid_to_world(v1_c, v_origin, cell_m)
+            n_sides = 2 + (1 if left_v else 0) + (1 if right_v else 0)
+            confidence = n_sides / 4.0
 
-                    confidence = 1.0
+            u0_c = left_v['col_max']  if left_v  else u_lo
+            u1_c = right_v['col_min'] if right_v else u_hi
 
-                    candidates.append(dict(
-                        bbox_2d=[wu0, wv0, wu1, wv1],
-                        opening_w=wu1 - wu0,
-                        opening_h=wv1 - wv0,
-                        opening_area_m2=(wu1 - wu0) * (wv1 - wv0),
-                        confidence=confidence,
-                        u0_c=u0_c, u1_c=u1_c, v0_c=v0_c, v1_c=v1_c,
-                    ))
+            wu0 = _grid_to_world(u0_c, u_origin, cell_m)
+            wu1 = _grid_to_world(u1_c, u_origin, cell_m)
+            wv0 = _grid_to_world(v0_c, v_origin, cell_m)
+            wv1 = _grid_to_world(v1_c, v_origin, cell_m)
+
+            candidates.append(dict(
+                bbox_2d=[wu0, wv0, wu1, wv1],
+                opening_w=wu1 - wu0,
+                opening_h=wv1 - wv0,
+                opening_area_m2=(wu1 - wu0) * (wv1 - wv0),
+                confidence=confidence,
+                u0_c=u0_c, u1_c=u1_c, v0_c=v0_c, v1_c=v1_c,
+            ))
 
     return candidates
 
 
 # ---------------------------------------------------------------------------
-# Pipe detection inside a gate
+# v1: Global row/column projection — RETIRED
+# Kept for reference. Fatal flaw: normalises by full grid width, so a 5m beam
+# in a 60m-wide slice fills only 8% of a row and never exceeds the 20% threshold.
+# ---------------------------------------------------------------------------
+
+# def _find_dense_spans(
+#     projection: np.ndarray,
+#     grid_size: int,
+#     min_fill_fraction: float = 0.20,
+#     min_span_cells: int = 3,
+#     merge_gap_cells: int = 4,
+# ) -> list[tuple[int, int]]:
+#     norm = projection / max(grid_size, 1)
+#     dense = norm >= min_fill_fraction
+#     spans = []
+#     in_span = False
+#     start = 0
+#     for i, d in enumerate(dense):
+#         if d and not in_span:
+#             start = i; in_span = True
+#         elif not d and in_span:
+#             if i - start >= min_span_cells:
+#                 spans.append((start, i - 1))
+#             in_span = False
+#     if in_span and len(dense) - start >= min_span_cells:
+#         spans.append((start, len(dense) - 1))
+#     if not spans:
+#         return []
+#     merged = [spans[0]]
+#     for s, e in spans[1:]:
+#         if s - merged[-1][1] <= merge_gap_cells:
+#             merged[-1] = (merged[-1][0], e)
+#         else:
+#             merged.append((s, e))
+#     return merged
+#
+#
+# def _spans_overlap(a, b, min_overlap_cells=5):
+#     return (min(a[1], b[1]) - max(a[0], b[0])) >= min_overlap_cells
+#
+#
+# def _find_gate_rects_v1(h_spans, v_spans, grid, cell_m, u_origin, v_origin,
+#                          min_gate_w_cells, max_gate_w_cells,
+#                          min_gate_h_cells, max_gate_h_cells):
+#     n_rows, n_cols = grid.shape
+#     candidates = []
+#     for i, h1 in enumerate(h_spans):
+#         for h2 in h_spans[i + 1:]:
+#             bot, top = h1, h2
+#             gate_h = top[0] - bot[1]
+#             if not (min_gate_h_cells <= gate_h <= max_gate_h_cells):
+#                 continue
+#             for j, v1 in enumerate(v_spans):
+#                 for v2 in v_spans[j + 1:]:
+#                     left, right = v1, v2
+#                     gate_w = right[0] - left[1]
+#                     if not (min_gate_w_cells <= gate_w <= max_gate_w_cells):
+#                         continue
+#                     gate_v_range = (bot[0], top[1])
+#                     if not (_spans_overlap(left, gate_v_range, 3) and
+#                             _spans_overlap(right, gate_v_range, 3)):
+#                         continue
+#                     u0_c = left[1] + 1; u1_c = right[0] - 1
+#                     v0_c = bot[1] + 1;  v1_c = top[0] - 1
+#                     wu0 = _grid_to_world(u0_c, u_origin, cell_m)
+#                     wu1 = _grid_to_world(u1_c, u_origin, cell_m)
+#                     wv0 = _grid_to_world(v0_c, v_origin, cell_m)
+#                     wv1 = _grid_to_world(v1_c, v_origin, cell_m)
+#                     candidates.append(dict(
+#                         bbox_2d=[wu0, wv0, wu1, wv1],
+#                         opening_w=wu1-wu0, opening_h=wv1-wv0,
+#                         opening_area_m2=(wu1-wu0)*(wv1-wv0),
+#                         confidence=1.0,
+#                         u0_c=u0_c, u1_c=u1_c, v0_c=v0_c, v1_c=v1_c,
+#                     ))
+#     return candidates
+
+
+# ---------------------------------------------------------------------------
+# Pipe detection inside a gate (unchanged)
 # ---------------------------------------------------------------------------
 
 def _count_pipes_in_gate(
     uv: np.ndarray,
     bbox_2d: list,
     cell_m: float = 0.020,
-    min_pipe_r_m: float = 0.025,   # NPS 0.5 = 21mm OD
-    max_pipe_r_m: float = 0.400,   # NPS 16 = 406mm OD
+    min_pipe_r_m: float = 0.025,
+    max_pipe_r_m: float = 0.400,
     min_circularity: float = 0.35,
 ) -> tuple[int, list]:
-    """Count pipe cross-sections inside a gate using connected-component circularity.
-
-    Returns:
-        pipe_count: estimated number of pipes
-        locs: [[u_centre, v_centre], ...] of each pipe
-    """
     u0, v0, u1, v1 = bbox_2d
     mask = (
         (uv[:, 0] >= u0) & (uv[:, 0] <= u1) &
@@ -249,7 +401,6 @@ def _count_pipes_in_gate(
     if len(sub) < 5:
         return 0, []
 
-    # Fine raster inside the gate
     border = cell_m * 3
     uo = u0 - border
     vo = v0 - border
@@ -278,21 +429,15 @@ def _count_pipes_in_gate(
         area_cells = comp.sum()
         if not (min_area <= area_cells <= max_area):
             continue
-
-        # Bounding box of component
         vr = sl[0]
         ur = sl[1]
         h = vr.stop - vr.start
         w = ur.stop - ur.start
         if h == 0 or w == 0:
             continue
-
-        # Circularity: 4π·area / perimeter² — approximate perimeter from bbox
         aspect = min(h, w) / max(h, w)
         if aspect < min_circularity:
             continue
-
-        # Centre in world coords
         uc = uo + (ur.start + ur.stop) / 2 * cell_m
         vc = vo + (vr.start + vr.stop) / 2 * cell_m
         pipe_count += 1
@@ -316,46 +461,27 @@ def detect_gates(
     max_gate_w: float = 8.0,
     min_gate_h: float = 0.3,
     max_gate_h: float = 6.0,
-    min_beam_fill: float = 0.20,
+    min_beam_fill: float = 0.20,   # retained in signature for compatibility, unused in v2
 ) -> list[Gate]:
-    """Detect pipe rack gates in a 2D cross-section slice.
-
-    Args:
-        uv:           (M, 2) 2D projected points from slab extraction
-        axis:         'X' or 'Y' (slice normal axis)
-        position_m:   slice position
-        thickness_m:  slab thickness
-        pts3d:        corresponding (M, 3) 3D points (for bbox_3d)
-        cell_m:       raster cell size in metres
-        min/max_gate_w/h: gate size bounds in metres
-
-    Returns:
-        list of Gate objects, sorted by confidence desc then pipe_count desc
-    """
+    """Detect pipe rack gates in a 2D cross-section slice (v2 algorithm)."""
     if len(uv) < 10:
         return []
 
     grid, u_origin, u_end, v_origin, v_end = _rasterize(uv, cell_m)
-    n_rows, n_cols = grid.shape
 
     min_gate_w_cells = max(1, int(min_gate_w / cell_m))
     max_gate_w_cells = int(max_gate_w / cell_m)
     min_gate_h_cells = max(1, int(min_gate_h / cell_m))
     max_gate_h_cells = int(max_gate_h / cell_m)
 
-    # Row sums → horizontal beam spans (structures running along U, span in V)
-    row_sums = grid.sum(axis=1).astype(float)
-    h_spans = _find_dense_spans(row_sums, n_cols, min_fill_fraction=min_beam_fill)
+    h_bands = _find_h_bands(grid, max_gap_cells=20, min_run_cells=10, merge_row_gap=4)
+    v_bands = _find_v_bands(grid, max_gap_cells=20, min_run_cells=10, merge_col_gap=4)
 
-    # Column sums → vertical beam spans
-    col_sums = grid.sum(axis=0).astype(float)
-    v_spans = _find_dense_spans(col_sums, n_rows, min_fill_fraction=min_beam_fill)
-
-    if not h_spans or not v_spans:
+    if not h_bands:
         return []
 
-    rects = _find_gate_rects(
-        h_spans, v_spans, grid, cell_m,
+    rects = _find_gate_rects_v2(
+        h_bands, v_bands, cell_m,
         u_origin, v_origin,
         min_gate_w_cells, max_gate_w_cells,
         min_gate_h_cells, max_gate_h_cells,
@@ -367,7 +493,7 @@ def detect_gates(
     for r in rects:
         bbox2 = r["bbox_2d"]
 
-        # Deduplicate: skip if very similar bbox already captured
+        # Deduplicate
         is_dup = False
         for sb in seen_bboxes:
             if (abs(bbox2[0] - sb[0]) < cell_m * 5 and
@@ -382,19 +508,18 @@ def detect_gates(
 
         pipe_count, pipe_locs = _count_pipes_in_gate(uv, bbox2)
 
-        # 3D bounding box
         axis_up = axis.upper()
         u_idx = {"X": 1, "Y": 0}[axis_up]
-        v_idx = 2   # V is always Z
+        v_idx = 2
         ax_idx = {"X": 0, "Y": 1}[axis_up]
 
         b3 = [0.0] * 6
         b3[ax_idx]     = position_m - thickness_m / 2
         b3[ax_idx + 3] = position_m + thickness_m / 2
-        b3[u_idx]     = bbox2[0]
-        b3[u_idx + 3] = bbox2[2]
-        b3[v_idx]     = bbox2[1]
-        b3[v_idx + 3] = bbox2[3]
+        b3[u_idx]      = bbox2[0]
+        b3[u_idx + 3]  = bbox2[2]
+        b3[v_idx]      = bbox2[1]
+        b3[v_idx + 3]  = bbox2[3]
 
         g = Gate(
             gate_id=f"GATE_{uuid.uuid4().hex[:6].upper()}",
