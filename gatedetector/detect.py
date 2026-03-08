@@ -491,7 +491,7 @@ def detect_gates(
     seen_bboxes: list[list] = []
 
     for r in rects:
-        bbox2 = r["bbox_2d"]
+        bbox2 = [float(v) for v in r["bbox_2d"]]
 
         # Deduplicate
         is_dup = False
@@ -530,8 +530,8 @@ def detect_gates(
             bbox_3d=b3,
             pipe_count=pipe_count,
             pipe_locs_2d=pipe_locs,
-            opening_area_m2=r["opening_area_m2"],
-            confidence=r["confidence"],
+            opening_area_m2=float(r["opening_area_m2"]),
+            confidence=float(r["confidence"]),
             source="auto",
         )
         gates.append(g)
