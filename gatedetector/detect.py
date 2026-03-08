@@ -99,122 +99,110 @@ def _grid_to_world(idx: int, origin: float, cell_m: float) -> float:
 # v2: Local segment detection (gap-tolerant)
 # ---------------------------------------------------------------------------
 
-def _fill_gaps_1d(arr: np.ndarray, max_gap: int) -> np.ndarray:
-    """Fill runs of False up to max_gap cells in a 1D boolean array.
-
-    Handles LiDAR blind spots: a beam interrupted by a shadow still reads
-    as a single continuous run after filling.
-    Only fills interior gaps (not leading/trailing False regions).
-    """
-    out = arr.copy()
-    n = len(out)
-    i = 0
-    while i < n:
-        if not out[i]:
-            j = i
-            while j < n and not out[j]:
-                j += 1
-            # Only fill if gap is bounded on both sides and short enough
-            if j - i <= max_gap and i > 0 and j < n:
-                out[i:j] = True
-            i = max(i + 1, j)
-        else:
-            i += 1
-    return out
+def _band_from_rows(grid: np.ndarray, rows: list[int]) -> dict | None:
+    """Build a band dict from a list of row indices."""
+    col_any = grid[rows, :].any(axis=0)
+    occ = np.where(col_any)[0]
+    if len(occ) == 0:
+        return None
+    return dict(row_min=rows[0], row_max=rows[-1],
+                col_min=int(occ[0]), col_max=int(occ[-1]))
 
 
-def _runs_1d(arr: np.ndarray, min_run: int) -> list[tuple[int, int]]:
-    """Return (start, end) inclusive pairs for True runs of length >= min_run."""
-    runs = []
-    n = len(arr)
-    i = 0
-    while i < n:
-        if arr[i]:
-            j = i + 1
-            while j < n and arr[j]:
-                j += 1
-            if j - i >= min_run:
-                runs.append((i, j - 1))
-            i = j
-        else:
-            i += 1
-    return runs
+def _band_from_cols(grid: np.ndarray, cols: list[int]) -> dict | None:
+    """Build a band dict from a list of column indices."""
+    row_any = grid[:, cols].any(axis=1)
+    occ = np.where(row_any)[0]
+    if len(occ) == 0:
+        return None
+    return dict(col_min=cols[0], col_max=cols[-1],
+                row_min=int(occ[0]), row_max=int(occ[-1]))
 
 
 def _find_h_bands(
     grid: np.ndarray,
-    max_gap_cells: int = 20,
     min_run_cells: int = 10,
     merge_row_gap: int = 4,
+    prominence_frac: float = 0.01,
 ) -> list[dict]:
-    """Find horizontal beam bands.
+    """Find horizontal beam bands using local density peak detection.
 
-    For each row, gap-fill then find horizontal runs of >= min_run_cells.
-    Group rows with runs into bands (consecutive rows within merge_row_gap).
+    Computes row sums and finds peaks with prominence above local baseline.
+    Works in dense cross-sections where global fill-fraction thresholds fail:
+    a structural beam creates a row-density spike even when the gate interior
+    is full of pipes.
 
     Returns list of dicts: {row_min, row_max, col_min, col_max}
     """
-    beam_rows = []
-    for r in range(grid.shape[0]):
-        filled = _fill_gaps_1d(grid[r], max_gap_cells)
-        runs = _runs_1d(filled, min_run_cells)
-        if runs:
-            c0 = min(s for s, _ in runs)
-            c1 = max(e for _, e in runs)
-            beam_rows.append((r, c0, c1))
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.signal import find_peaks
 
-    if not beam_rows:
+    row_sums = grid.sum(axis=1).astype(float)
+    n_cols = grid.shape[1]
+
+    # Smooth lightly to bridge single-row LiDAR gaps without blurring beam edges
+    smooth = gaussian_filter1d(row_sums, sigma=1.5)
+
+    prominence = max(min_run_cells, n_cols * prominence_frac)
+    peaks, _ = find_peaks(smooth, distance=merge_row_gap + 1, prominence=prominence)
+
+    if len(peaks) == 0:
         return []
 
+    # Group adjacent peaks into bands
     bands = []
-    cur = dict(row_min=beam_rows[0][0], row_max=beam_rows[0][0],
-               col_min=beam_rows[0][1], col_max=beam_rows[0][2])
-    for r, c0, c1 in beam_rows[1:]:
-        if r - cur['row_max'] <= merge_row_gap:
-            cur['row_max'] = r
-            cur['col_min'] = min(cur['col_min'], c0)
-            cur['col_max'] = max(cur['col_max'], c1)
+    group = [int(peaks[0])]
+    for p in peaks[1:]:
+        if p - group[-1] <= merge_row_gap:
+            group.append(int(p))
         else:
-            bands.append(cur)
-            cur = dict(row_min=r, row_max=r, col_min=c0, col_max=c1)
-    bands.append(cur)
+            b = _band_from_rows(grid, group)
+            if b:
+                bands.append(b)
+            group = [int(p)]
+    b = _band_from_rows(grid, group)
+    if b:
+        bands.append(b)
     return bands
 
 
 def _find_v_bands(
     grid: np.ndarray,
-    max_gap_cells: int = 20,
     min_run_cells: int = 10,
     merge_col_gap: int = 4,
+    prominence_frac: float = 0.01,
 ) -> list[dict]:
     """Find vertical beam bands (same logic transposed).
 
     Returns list of dicts: {col_min, col_max, row_min, row_max}
     """
-    beam_cols = []
-    for c in range(grid.shape[1]):
-        filled = _fill_gaps_1d(grid[:, c], max_gap_cells)
-        runs = _runs_1d(filled, min_run_cells)
-        if runs:
-            r0 = min(s for s, _ in runs)
-            r1 = max(e for _, e in runs)
-            beam_cols.append((c, r0, r1))
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.signal import find_peaks
 
-    if not beam_cols:
+    col_sums = grid.sum(axis=0).astype(float)
+    n_rows = grid.shape[0]
+
+    smooth = gaussian_filter1d(col_sums, sigma=1.5)
+
+    prominence = max(min_run_cells, n_rows * prominence_frac)
+    peaks, _ = find_peaks(smooth, distance=merge_col_gap + 1, prominence=prominence)
+
+    if len(peaks) == 0:
         return []
 
     bands = []
-    cur = dict(col_min=beam_cols[0][0], col_max=beam_cols[0][0],
-               row_min=beam_cols[0][1], row_max=beam_cols[0][2])
-    for c, r0, r1 in beam_cols[1:]:
-        if c - cur['col_max'] <= merge_col_gap:
-            cur['col_max'] = c
-            cur['row_min'] = min(cur['row_min'], r0)
-            cur['row_max'] = max(cur['row_max'], r1)
+    group = [int(peaks[0])]
+    for p in peaks[1:]:
+        if p - group[-1] <= merge_col_gap:
+            group.append(int(p))
         else:
-            bands.append(cur)
-            cur = dict(col_min=c, col_max=c, row_min=r0, row_max=r1)
-    bands.append(cur)
+            b = _band_from_cols(grid, group)
+            if b:
+                bands.append(b)
+            group = [int(p)]
+    b = _band_from_cols(grid, group)
+    if b:
+        bands.append(b)
     return bands
 
 
@@ -479,8 +467,8 @@ def detect_gates(
     min_gate_h_cells = max(1, int(min_gate_h / cell_m))
     max_gate_h_cells = int(max_gate_h / cell_m)
 
-    h_bands = _find_h_bands(grid, max_gap_cells=20, min_run_cells=10, merge_row_gap=4)
-    v_bands = _find_v_bands(grid, max_gap_cells=20, min_run_cells=10, merge_col_gap=4)
+    h_bands = _find_h_bands(grid, min_run_cells=10, merge_row_gap=4)
+    v_bands = _find_v_bands(grid, min_run_cells=10, merge_col_gap=4)
 
     if not h_bands:
         return [], f"0 h-bands found (grid {grid.shape[1]}×{grid.shape[0]} cells)."
