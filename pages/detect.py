@@ -780,16 +780,15 @@ def trigger_load(n_clicks, path):
             suffix = p.suffix.lower()
 
             if suffix == ".npy":
-                print(f"[Load] opening: {p} ({p.stat().st_size/1e9:.2f} GB)", flush=True)
-                cache.set_status(f"Opening {p.name}…", 0.05)
-                pts = np.load(str(p), mmap_mode="r")
-                print(f"[Load] mapped: shape={pts.shape} dtype={pts.dtype}", flush=True)
+                print(f"[Load] reading: {p} ({p.stat().st_size/1e9:.2f} GB)", flush=True)
+                cache.set_status(f"Reading {p.name}…", 0.1)
+                pts = np.load(str(p))
+                print(f"[Load] loaded: shape={pts.shape} dtype={pts.dtype}", flush=True)
                 if pts.ndim != 2 or pts.shape[1] < 3:
                     cache.set_status("Error: .npy must be (N, ≥3) array.", 0.0)
                     return
-                cache.set_status(f"Reading {p.name} into memory…", 0.2)
+                cache.set_status("Converting…", 0.8)
                 pts = pts[:, :3].astype(np.float32)
-                print(f"[Load] loaded {len(pts):,} points.", flush=True)
                 cache.set_status("Caching…", 0.9)
                 cache.set_cloud(pts)
                 print("[Load] Done.", flush=True)
