@@ -6,6 +6,7 @@ and the live gate registry (persisted to gates.json on every write).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -15,7 +16,8 @@ _cloud: Optional[np.ndarray] = None   # (N, 3) float32
 _load_status: str = ""                # progress string for UI polling
 _load_progress: float = 0.0           # 0.0–1.0
 
-GATES_FILE = Path(__file__).parent / "gates.json"
+GATES_FILE = Path(os.environ.get("GATEDETECTOR_GATES_FILE",
+                                 Path(__file__).parent / "gates.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -47,10 +49,14 @@ def get_status() -> tuple[str, float]:
 # ---------------------------------------------------------------------------
 
 def load_gates() -> list[dict]:
-    """Load gates from disk (called on startup / page refresh)."""
+    """Load gates from disk. Handles both raw list and AutoGateDetector {gates:[...]} format."""
     if GATES_FILE.exists():
         try:
-            return json.loads(GATES_FILE.read_text())
+            raw = json.loads(GATES_FILE.read_text())
+            if isinstance(raw, list):
+                return raw
+            if isinstance(raw, dict):
+                return raw.get("gates", [])
         except Exception:
             pass
     return []

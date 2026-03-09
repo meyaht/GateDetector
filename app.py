@@ -1,4 +1,12 @@
 """GateDetector — standalone Dash app for pipe rack gate identification."""
+import os
+import sys
+
+# Accept optional gates file as first positional arg before any imports read it.
+# Usage: python app.py C:/path/to/202503081200_gates.json
+if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+    os.environ["GATEDETECTOR_GATES_FILE"] = sys.argv.pop(1)
+
 import threading
 import webbrowser
 

@@ -202,8 +202,27 @@ def _slice_fig(uv: np.ndarray, u_label: str, v_label: str,
 
 
 def _build_table(gates: list[dict]) -> html.Div:
-    if not gates:
-        return dbc.Alert("No gates registered yet.", color="secondary", className="small py-1")
+    meta = next((g for g in gates if g.get("gate_id") == "_CLOUD_META_"), None)
+    real_gates = [g for g in gates if g.get("gate_id") != "_CLOUD_META_"]
+
+    parts = []
+    if meta:
+        rot  = meta.get("plan_rotation", 0)
+        bmin = meta.get("cloud_bmin")
+        bmax = meta.get("cloud_bmax")
+        bounds = ""
+        if bmin and bmax:
+            bounds = (f"   X {bmin[0]:.1f}–{bmax[0]:.1f}  "
+                      f"Y {bmin[1]:.1f}–{bmax[1]:.1f}  "
+                      f"Z {bmin[2]:.1f}–{bmax[2]:.1f} m")
+        parts.append(dbc.Alert(
+            f"Saved rotation: {rot}°{bounds}",
+            color="dark", className="py-1 mb-2 small font-monospace",
+        ))
+
+    if not real_gates:
+        parts.append(dbc.Alert("No gates registered yet.", color="secondary", className="small py-1"))
+        return html.Div(parts)
 
     header = html.Thead(html.Tr([
         html.Th("ID"), html.Th("Axis"), html.Th("Pos (m)"),
@@ -212,7 +231,7 @@ def _build_table(gates: list[dict]) -> html.Div:
     ]))
 
     rows = []
-    for g in gates:
+    for g in real_gates:
         bbox = g.get("bbox_2d", [0, 0, 1, 1])
         w = round(bbox[2] - bbox[0], 2) if len(bbox) == 4 else "—"
         h = round(bbox[3] - bbox[1], 2) if len(bbox) == 4 else "—"
@@ -235,11 +254,12 @@ def _build_table(gates: list[dict]) -> html.Div:
                 color="danger", outline=True, size="sm", className="py-0 px-1")),
         ]))
 
-    return dbc.Table(
+    parts.append(dbc.Table(
         [header, html.Tbody(rows)],
         bordered=True, hover=True, responsive=True,
         size="sm", className="table-dark small",
-    )
+    ))
+    return html.Div(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +361,9 @@ layout = dbc.Container(fluid=True, children=[
         ]), width="auto"),
         dbc.Col(html.Span(id="rot-display", className="small text-info ms-2"), width="auto",
                 className="d-flex align-items-center"),
+        dbc.Col(dbc.Button("Apply from registry", id="apply-rot-btn",
+                           color="info", outline=True, size="sm"), width="auto",
+                className="d-flex align-items-center ms-3"),
     ], className="g-2 mb-3 align-items-center"),
 
     # ---- Dual view -------------------------------------------------------
@@ -390,10 +413,12 @@ layout = dbc.Container(fluid=True, children=[
 
     # ---- Gate registry ---------------------------------------------------
     html.H6("Gate Registry", className="mb-1"),
-    html.Div(id="gates-table", className="mb-3"),
+    html.Div(id="gates-table", children=_build_table(cache.load_gates()), className="mb-3"),
 
-    # ---- Export ----------------------------------------------------------
+    # ---- Import / Export -------------------------------------------------
     dbc.Row([
+        dbc.Col(dbc.Button("Import Gates JSON…", id="import-gates-btn",
+                           color="info", outline=True, size="sm"), width="auto"),
         dbc.Col(dbc.Button("Export JSON", id="export-json-btn",
                            color="secondary", outline=True, size="sm"), width="auto"),
         dbc.Col(dbc.Button("Export CSV",  id="export-csv-btn",
@@ -432,6 +457,33 @@ def update_rotation(m5, m1, reset, p1, p5, store):
     elif tid == "rot-p1-btn":  deg += 1
     elif tid == "rot-p5-btn":  deg += 5
     deg = round(deg % 360, 1)
+    store["plan_rotation"] = deg
+    bmin = store.get("cloud_bmin")
+    bmax = store.get("cloud_bmax")
+    if bmin and bmax:
+        cache.add_gate({"gate_id": "_CLOUD_META_", "plan_rotation": deg,
+                        "cloud_bmin": bmin, "cloud_bmax": bmax})
+    return store, f"{deg}°"
+
+
+# ---------------------------------------------------------------------------
+# Apply rotation from registry
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("store",       "data",    allow_duplicate=True),
+    Output("rot-display", "children", allow_duplicate=True),
+    Input("apply-rot-btn", "n_clicks"),
+    State("store",         "data"),
+    prevent_initial_call=True,
+)
+def apply_rotation_from_registry(_, store):
+    gates = cache.load_gates()
+    meta = next((g for g in gates if g.get("gate_id") == "_CLOUD_META_"), None)
+    if not meta:
+        return dash.no_update, dash.no_update
+    store = store or {}
+    deg = float(meta.get("plan_rotation", 0))
     store["plan_rotation"] = deg
     return store, f"{deg}°"
 
@@ -742,6 +794,46 @@ def export_gates(json_n, csv_n):
                f"Exported {len(gates)} gates as CSV."
 
     return dash.no_update, dash.no_update
+
+
+# ---------------------------------------------------------------------------
+# Import gates from AutoGateDetector / GateDetector JSON
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("gates-table",   "children",  allow_duplicate=True),
+    Output("export-status", "children",  allow_duplicate=True),
+    Input("import-gates-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def import_gates(_):
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes("-topmost", True)
+    path = filedialog.askopenfilename(
+        title="Select gates.json",
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+    )
+    root.destroy()
+    if not path:
+        return dash.no_update, dash.no_update
+
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+        # Handle both AutoGateDetector format {"gates": [...]} and raw list
+        gate_list = raw.get("gates", []) if isinstance(raw, dict) else raw
+        gate_list = [g for g in gate_list if "bbox_3d" in g]
+        cache.save_gates(gate_list)
+        return (
+            _build_table(gate_list),
+            dbc.Alert(f"Imported {len(gate_list)} gates from {Path(path).name}",
+                      color="info", className="py-1"),
+        )
+    except Exception as e:
+        return dash.no_update, dbc.Alert(f"Import error: {e}", color="danger", className="py-1")
 
 
 # ---------------------------------------------------------------------------
