@@ -1,7 +1,7 @@
 """Server-side in-memory cache for GateDetector.
 
-Holds the loaded point cloud array (avoid repeated disk reads)
-and the live gate registry (persisted to gates.json on every write).
+Holds the gate registry (persisted to gates.json on every write)
+and the images directory for the current run's PNG outputs.
 """
 from __future__ import annotations
 
@@ -12,16 +12,42 @@ from typing import Optional
 
 import numpy as np
 
-_cloud: Optional[np.ndarray] = None   # (N, 3) float32
-_load_status: str = ""                # progress string for UI polling
-_load_progress: float = 0.0           # 0.0–1.0
+_cloud: Optional[np.ndarray] = None   # kept for backwards compat, not used by UI
+_load_status: str = ""
+_load_progress: float = 0.0
+_images_dir: Optional[Path] = None    # directory containing plan.png + slice PNGs
 
 GATES_FILE = Path(os.environ.get("GATEDETECTOR_GATES_FILE",
                                  Path(__file__).parent / "gates.json"))
 
 
 # ---------------------------------------------------------------------------
-# Cloud
+# Images directory
+# ---------------------------------------------------------------------------
+
+def set_images_dir(p: Path) -> None:
+    global _images_dir
+    _images_dir = p
+
+
+def get_images_dir() -> Optional[Path]:
+    """Return directory containing plan.png and slice PNGs for the current run.
+
+    Priority:
+    1. Explicitly set via set_images_dir() (after import dialog)
+    2. Parent of GATEDETECTOR_GATES_FILE env var (command-line launch)
+    3. None (no run loaded yet)
+    """
+    if _images_dir:
+        return _images_dir
+    env_path = os.environ.get("GATEDETECTOR_GATES_FILE")
+    if env_path:
+        return Path(env_path).parent
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Cloud (retained for backwards compatibility)
 # ---------------------------------------------------------------------------
 
 def set_cloud(pts: np.ndarray) -> None:

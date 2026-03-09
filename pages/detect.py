@@ -1,214 +1,50 @@
-"""Page 2 — Detect: slice viewer, auto-detect, manual gate marking, registry.
+"""Page 1 — Detect: image-based gate review and registry management.
 
-Layout
-------
-  [Slice Controls] (top bar)
-  [Plan View XY]  |  [Slice View 2D cross-section]
-  [Gate Registry Table]
-  [Export Bar]
+No point cloud loading required.  GateDetector now displays pre-generated
+PNG images produced by AutoGateDetector:
+  - plan.png      — top-down XY overview of the full cloud with gate footprints
+  - slice_*.png   — per-gate cross-section slices
 
-Trackpad-friendly:
-  - All navigation via buttons + number inputs (no 3D manipulation required)
-  - Arrow buttons to step through slice positions
-  - Click plan view to jump slice position
-  - Plotly 2D box-select to draw manual gates
-  - Equal aspect ratio on both views
+Click the ⬜ button on any gate row to view that gate's slice image.
 """
 from __future__ import annotations
 
-import json
+import base64
 import csv
 import io
-import uuid
-import threading
-import time
+import json
 from pathlib import Path
 
-import numpy as np
-import plotly.graph_objects as go
 import dash
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, callback, dcc, html, ctx
 
 import cache
-from gatedetector.slab import extract_slab, plan_projection, cloud_bounds
-from gatedetector.detect import detect_gates, Gate
 
 dash.register_page(__name__, path="/", title="GateDetector")
 
 
 # ---------------------------------------------------------------------------
-# Helper figures — defined BEFORE layout
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _hex_to_rgb(h: str) -> tuple:
-    h = h.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+def _img_src(path: Path | None) -> str:
+    """Return a base64 PNG data-URL, or empty string if the file is missing."""
+    if path and path.exists():
+        data = base64.b64encode(path.read_bytes()).decode()
+        return f"data:image/png;base64,{data}"
+    return ""
 
 
-def _empty_plan() -> go.Figure:
-    fig = go.Figure()
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(10,10,20,1)",
-        xaxis=dict(title="X (m)", color="#666"),
-        yaxis=dict(title="Y (m)", color="#666", scaleanchor="x"),
-        margin=dict(l=40, r=10, t=10, b=40),
-    )
-    return fig
-
-
-def _empty_slice() -> go.Figure:
-    fig = go.Figure()
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(10,10,20,1)",
-        xaxis=dict(title="U (m)", color="#666"),
-        yaxis=dict(title="Z (m)", color="#666", scaleanchor="x"),
-        margin=dict(l=40, r=10, t=10, b=40),
-        dragmode="select",
-    )
-    return fig
-
-
-def _rotate_pts(pts: np.ndarray, deg: float) -> np.ndarray:
-    """Return pts with X,Y rotated by deg degrees (Z unchanged).
-    When deg==0 returns original array (no copy). Otherwise only
-    allocates the two rotated columns to avoid a full 3-column copy."""
-    if deg == 0:
-        return pts
-    r = np.deg2rad(deg)
-    c, s = np.cos(r), np.sin(r)
-    x, y = pts[:, 0], pts[:, 1]
-    out = np.empty_like(pts)
-    out[:, 0] = x * c - y * s
-    out[:, 1] = x * s + y * c
-    out[:, 2] = pts[:, 2]
-    return out
-
-
-def _slab_mask(pts: np.ndarray, axis: str, position_m: float,
-               thick_m: float, deg: float) -> np.ndarray:
-    """Return boolean mask for slab membership after rotation,
-    without rotating all 3 columns of the full cloud."""
-    half = thick_m / 2
-    if deg == 0:
-        col = 1 if axis.upper() == "Y" else 0
-        return np.abs(pts[:, col] - position_m) <= half
-    r = np.deg2rad(deg)
-    c, s = np.cos(r), np.sin(r)
-    if axis.upper() == "Y":
-        rot_coord = pts[:, 0] * s + pts[:, 1] * c   # rotated Y
-    else:
-        rot_coord = pts[:, 0] * c - pts[:, 1] * s   # rotated X
-    return np.abs(rot_coord - position_m) <= half
-
-
-def _plan_fig(pts: np.ndarray, axis: str, position_m: float,
-              bn: dict, gates: list[dict], rot_deg: float = 0.0) -> go.Figure:
-    """pts should already be rotated before calling."""
-    x, y = plan_projection(pts, n_max=75_000)
-
-    fig = go.Figure(go.Scatter(
-        x=x.tolist(), y=y.tolist(), mode="markers",
-        marker=dict(size=1, color="#3498db", opacity=0.35),
-        hovertemplate="X:%{x:.2f} Y:%{y:.2f}<extra></extra>",
-        name="Cloud",
-    ))
-
-    axis_up = axis.upper()
-    if axis_up == "Y":
-        fig.add_shape(type="line",
-                      x0=bn["xmin"], x1=bn["xmax"],
-                      y0=position_m, y1=position_m,
-                      line=dict(color="#e74c3c", width=2, dash="dash"))
-    else:
-        fig.add_shape(type="line",
-                      x0=position_m, x1=position_m,
-                      y0=bn["ymin"], y1=bn["ymax"],
-                      line=dict(color="#e74c3c", width=2, dash="dash"))
-
-    # Rotate gate bbox corners to match the rotated plan view
-    r = np.deg2rad(rot_deg)
-    rc, rs = np.cos(r), np.sin(r)
-    for g in gates:
-        b3 = g.get("bbox_3d", [])
-        if len(b3) != 6:
-            continue
-        x0, y0, _, x1, y1, _ = b3
-        # Four corners of the XY footprint
-        corners = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]])
-        cx = corners[:, 0] * rc - corners[:, 1] * rs
-        cy = corners[:, 0] * rs + corners[:, 1] * rc
-        fig.add_trace(go.Scatter(
-            x=cx.tolist(), y=cy.tolist(), mode="lines",
-            line=dict(color="#f39c12", width=1),
-            fill="toself", fillcolor="rgba(243,156,18,0.1)",
-            hoverinfo="skip", showlegend=False,
-        ))
-
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(10,10,20,1)",
-        xaxis=dict(title="X′ (m)", color="#aaa", range=[bn["xmin"], bn["xmax"]]),
-        yaxis=dict(title="Y′ (m)", color="#aaa", scaleanchor="x",
-                   range=[bn["ymin"], bn["ymax"]]),
-        margin=dict(l=40, r=10, t=10, b=40),
-        showlegend=False,
-    )
-    return fig
-
-
-def _slice_fig(uv: np.ndarray, u_label: str, v_label: str,
-               gates: list[dict], position_m: float) -> go.Figure:
-    fig = go.Figure()
-
-    if len(uv) > 0:
-        n = min(200_000, len(uv))
-        if n < len(uv):
-            rng = np.random.default_rng(0)
-            idx = rng.choice(len(uv), n, replace=False, shuffle=False)
-            sub = uv[idx]
-        else:
-            sub = uv
-        fig.add_trace(go.Scatter(
-            x=sub[:, 0].tolist(), y=sub[:, 1].tolist(),
-            mode="markers",
-            marker=dict(size=2, color="#5dade2", opacity=0.5),
-            hovertemplate=f"{u_label}:%{{x:.3f}}  Z:%{{y:.3f}}<extra></extra>",
-            name="Scan",
-        ))
-
-    for g in gates:
-        if abs(g.get("position_m", 0) - position_m) > 2.0:
-            continue
-        bbox = g.get("bbox_2d", [])
-        if len(bbox) != 4:
-            continue
-        u0, v0, u1, v1 = bbox
-        lbl   = g.get("label") or g.get("gate_id", "")
-        color = "#e74c3c" if g.get("source") == "auto" else "#f39c12"
-        r, g2, b = _hex_to_rgb(color)
-        fig.add_shape(type="rect", x0=u0, y0=v0, x1=u1, y1=v1,
-                      line=dict(color=color, width=2),
-                      fillcolor=f"rgba({r},{g2},{b},0.08)")
-        fig.add_annotation(x=(u0+u1)/2, y=v1, text=lbl,
-                           showarrow=False, font=dict(color=color, size=10), yshift=8)
-        for pu, pv in g.get("pipe_locs_2d", []):
-            fig.add_shape(type="circle",
-                          x0=pu-0.1, y0=pv-0.1, x1=pu+0.1, y1=pv+0.1,
-                          line=dict(color="#2ecc71", width=1))
-
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(10,10,20,1)",
-        xaxis=dict(title=f"{u_label} (m)", color="#aaa"),
-        yaxis=dict(title="Z (m)", color="#aaa", scaleanchor="x"),
-        margin=dict(l=40, r=10, t=10, b=40),
-        dragmode="select",
-        showlegend=False,
-    )
-    return fig
+def _plan_src() -> str:
+    images_dir = cache.get_images_dir()
+    if not images_dir:
+        return ""
+    gates = cache.load_gates()
+    meta = next((g for g in gates if g.get("gate_id") == "_CLOUD_META_"), None)
+    if meta and meta.get("plan_image"):
+        return _img_src(images_dir / meta["plan_image"])
+    return _img_src(images_dir / "plan.png")
 
 
 def _build_table(gates: list[dict]) -> html.Div:
@@ -217,7 +53,6 @@ def _build_table(gates: list[dict]) -> html.Div:
 
     parts = []
 
-    # File + rotation header banner
     fname = cache.GATES_FILE.name
     rot = float(meta.get("plan_rotation", 0)) if meta else 0.0
     bmin = meta.get("cloud_bmin") if meta else None
@@ -237,6 +72,7 @@ def _build_table(gates: list[dict]) -> html.Div:
         return html.Div(parts)
 
     header = html.Thead(html.Tr([
+        html.Th(""),
         html.Th("ID"), html.Th("Axis"), html.Th("Pos (m)"),
         html.Th("W (m)"), html.Th("H (m)"), html.Th("Area (m²)"),
         html.Th("Pipes"), html.Th("Conf"), html.Th("Src"), html.Th("Label"), html.Th(""),
@@ -248,6 +84,12 @@ def _build_table(gates: list[dict]) -> html.Div:
         w = round(bbox[2] - bbox[0], 2) if len(bbox) == 4 else "—"
         h = round(bbox[3] - bbox[1], 2) if len(bbox) == 4 else "—"
         rows.append(html.Tr([
+            html.Td(dbc.Button(
+                "⬜",
+                id={"type": "view-gate-btn", "index": g.get("gate_id", "")},
+                color="info", outline=True, size="sm", className="py-0 px-1",
+                title="View slice image",
+            )),
             html.Td(html.Span(g.get("gate_id", ""), className="font-monospace small")),
             html.Td(g.get("axis", "?")),
             html.Td(f"{g.get('position_m', 0):.2f}"),
@@ -261,9 +103,11 @@ def _build_table(gates: list[dict]) -> html.Div:
                 color="success" if g.get("source") == "auto" else "warning",
             )),
             html.Td(g.get("label", "")),
-            html.Td(dbc.Button("✕",
+            html.Td(dbc.Button(
+                "✕",
                 id={"type": "del-gate-btn", "index": g.get("gate_id", "")},
-                color="danger", outline=True, size="sm", className="py-0 px-1")),
+                color="danger", outline=True, size="sm", className="py-0 px-1",
+            )),
         ]))
 
     parts.append(dbc.Table(
@@ -275,153 +119,38 @@ def _build_table(gates: list[dict]) -> html.Div:
 
 
 # ---------------------------------------------------------------------------
-# Layout — defined AFTER helpers
+# Layout
 # ---------------------------------------------------------------------------
-
-_SUPPORTED = ".npy  |  .e57  |  .pts  |  .xyz"
 
 layout = dbc.Container(fluid=True, children=[
 
-    # ---- Load section ---------------------------------------------------
-    dbc.Card(className="mb-3 mt-3", body=True, children=[
-        dbc.Row([
-            dbc.Col(dbc.Input(
-                id="load-path-input",
-                placeholder="Paste path to point cloud (.npy / .e57 / .pts) or click Browse…",
-                debounce=False,
-                className="font-monospace small",
-            ), md=6),
-            dbc.Col(dbc.Button("Browse…", id="browse-btn", color="secondary",
-                               outline=True, size="sm", className="w-100"), md=1),
-            dbc.Col([
-                dbc.Button("Load", id="load-btn", color="primary",
-                           size="sm", className="w-100"),
-                html.Div(id="load-timer-display",
-                         className="text-center mt-1",
-                         style={"fontSize": "0.75rem"}),
-            ], md=1),
-            dbc.Col(dbc.Button("Clear",   id="clear-btn",  color="secondary",
-                               outline=True, size="sm", className="w-100"), md=1),
-            dbc.Col(html.Div(id="load-status", className="small d-flex align-items-center"), md=3),
-        ], className="g-2 align-items-center"),
-        dcc.Interval(id="load-poll",     interval=400,  n_intervals=0, disabled=True),
-        dcc.Interval(id="timer-interval", interval=1000, n_intervals=0, disabled=True),
-        dcc.Store(id="load-start-store"),
-    ]),
-
-    # ---- Controls bar ---------------------------------------------------
-    dbc.Card(className="mb-3 mt-3", body=True, children=[
-        dbc.Row([
-            dbc.Col([
-                html.Label("Slice axis", className="small text-muted mb-1"),
-                dbc.RadioItems(
-                    id="axis-radio",
-                    options=[
-                        {"label": "X  (YZ gate — pipe travels in X)", "value": "X"},
-                        {"label": "Y  (XZ gate — pipe travels in Y)", "value": "Y"},
-                    ],
-                    value="Y",
-                    inline=True,
-                ),
-            ], md=4),
-
-            dbc.Col([
-                html.Label("Slice position (m)", className="small text-muted mb-1"),
-                dbc.InputGroup([
-                    dbc.Button("◄◄", id="step-back10-btn", color="secondary", outline=True, size="sm"),
-                    dbc.Button("◄",  id="step-back-btn",   color="secondary", outline=True, size="sm"),
-                    dbc.Input(id="pos-input", type="number", step=0.1,
-                              placeholder="0.0", className="text-center",
-                              style={"maxWidth": "100px"}),
-                    dbc.Button("►",  id="step-fwd-btn",    color="secondary", outline=True, size="sm"),
-                    dbc.Button("►►", id="step-fwd10-btn",  color="secondary", outline=True, size="sm"),
-                ], size="sm"),
-            ], md=3),
-
-            dbc.Col([
-                html.Label("Step (m)", className="small text-muted mb-1"),
-                dbc.Input(id="step-input", type="number", value=0.5, step=0.1,
-                          min=0.05, size="sm", style={"maxWidth": "80px"}),
-            ], md=1),
-
-            dbc.Col([
-                html.Label("Thickness (m)", className="small text-muted mb-1"),
-                dbc.Input(id="thick-input", type="number", value=0.4, step=0.05,
-                          min=0.05, size="sm", style={"maxWidth": "80px"}),
-            ], md=1),
-
-            dbc.Col([
-                html.Label("\u00a0", className="small d-block mb-1"),
-                dbc.ButtonGroup([
-                    dbc.Button("Update Slice", id="slice-btn",  color="primary", size="sm"),
-                    dbc.Button("Auto-Detect",  id="detect-btn", color="success", size="sm"),
-                ]),
-            ], md=3),
-        ], className="g-2 align-items-end"),
-    ]),
-
-    # ---- Plan rotation controls -----------------------------------------
-    dbc.Row([
-        dbc.Col(html.Span("Plan rotation:", className="small text-muted"), width="auto",
-                className="d-flex align-items-center"),
-        dbc.Col(dbc.ButtonGroup([
-            dbc.Button("−5°", id="rot-m5-btn",    color="secondary", outline=True, size="sm"),
-            dbc.Button("−1°", id="rot-m1-btn",    color="secondary", outline=True, size="sm"),
-            dbc.Button("0°",  id="rot-reset-btn", color="secondary", outline=True, size="sm"),
-            dbc.Button("+1°", id="rot-p1-btn",    color="secondary", outline=True, size="sm"),
-            dbc.Button("+5°", id="rot-p5-btn",    color="secondary", outline=True, size="sm"),
-        ]), width="auto"),
-        dbc.Col(html.Span(id="rot-display", className="small text-info ms-2"), width="auto",
-                className="d-flex align-items-center"),
-        dbc.Col(dbc.Button("Apply from registry", id="apply-rot-btn",
-                           color="info", outline=True, size="sm"), width="auto",
-                className="d-flex align-items-center ms-3"),
-    ], className="g-2 mb-3 align-items-center"),
-
-    # ---- Dual view -------------------------------------------------------
+    # ---- Dual image view -------------------------------------------------
     dbc.Row([
         dbc.Col([
-            html.H6("Plan View  (click to jump slice position)",
-                    className="text-muted mb-1 small"),
-            dcc.Graph(
-                id="plan-graph",
-                figure=_empty_plan(),
-                style={"height": "45vh"},
-                config={"scrollZoom": True, "displayModeBar": False},
+            html.H6("Plan View  (XY overview)", className="text-muted mb-1 small"),
+            html.Img(
+                id="plan-img",
+                style={"width": "100%", "maxHeight": "48vh",
+                       "objectFit": "contain", "background": "#0a0a14",
+                       "display": "block"},
             ),
         ], md=5),
 
         dbc.Col([
             html.H6(id="slice-title",
-                    children="Cross-section  (box-select to mark gate)",
+                    children="Click ⬜ on a gate row to view its slice image",
                     className="text-muted mb-1 small"),
-            dcc.Graph(
-                id="slice-graph",
-                figure=_empty_slice(),
-                style={"height": "45vh"},
-                config={"scrollZoom": True, "displayModeBar": True,
-                        "modeBarButtonsToAdd": ["select2d"]},
+            html.Img(
+                id="slice-img",
+                style={"width": "100%", "maxHeight": "48vh",
+                       "objectFit": "contain", "background": "#0a0a14",
+                       "display": "block"},
             ),
         ], md=7),
-    ], className="mb-3"),
+    ], className="mb-3 mt-3"),
 
-    # Status line
+    # ---- Status line -----------------------------------------------------
     html.Div(id="detect-status", className="small text-info mb-2"),
-
-    # ---- Manual gate controls -------------------------------------------
-    dbc.Card(className="mb-3", body=True, children=[
-        dbc.Row([
-            dbc.Col(html.Span("Manual gate from selection:", className="small text-muted"), md=3),
-            dbc.Col(dbc.Input(id="gate-label-input",
-                              placeholder="Label (optional)", size="sm"), md=4),
-            dbc.Col(dbc.Button("Add Selected Gate", id="add-gate-btn",
-                               color="warning", outline=True, size="sm"), md=2),
-            dbc.Col(dbc.Button("Clear All Gates", id="clear-gates-btn",
-                               color="danger", outline=True, size="sm"), md=2),
-            dbc.Col(dbc.Button("Refresh", id="refresh-gates-btn",
-                               color="secondary", outline=True, size="sm"), md=1),
-        ], className="g-2 align-items-center"),
-    ]),
 
     # ---- Gate registry ---------------------------------------------------
     html.H6("Gate Registry", className="mb-1"),
@@ -435,320 +164,71 @@ layout = dbc.Container(fluid=True, children=[
                            color="secondary", outline=True, size="sm"), width="auto"),
         dbc.Col(dbc.Button("Export CSV",  id="export-csv-btn",
                            color="secondary", outline=True, size="sm"), width="auto"),
+        dbc.Col(dbc.Button("Clear All Gates", id="clear-gates-btn",
+                           color="danger", outline=True, size="sm"), width="auto"),
         dbc.Col(html.Div(id="export-status", className="small text-info")),
     ], className="g-2 align-items-center mb-4"),
+
     dcc.Download(id="gates-dl"),
 
-    # Hidden store for box-select bbox
-    dcc.Store(id="selection-store"),
+    # Arrow-key navigation state
+    dcc.Store(id="keyboard-store",  data={"r": 0, "l": 0, "t": 0}),
+    dcc.Store(id="gate-nav-idx",    data=0),
+    dcc.Store(id="key-last-count",  data={"r": 0, "l": 0}),
+    dcc.Interval(id="key-poll", interval=150, n_intervals=0),
 ])
 
 
 # ---------------------------------------------------------------------------
-# Rotation buttons → update store
+# Init: load plan image when page loads (fires on store init)
 # ---------------------------------------------------------------------------
 
 @callback(
-    Output("store",       "data",    allow_duplicate=True),
-    Output("rot-display", "children"),
-    Input("rot-m5-btn",   "n_clicks"),
-    Input("rot-m1-btn",   "n_clicks"),
-    Input("rot-reset-btn","n_clicks"),
-    Input("rot-p1-btn",   "n_clicks"),
-    Input("rot-p5-btn",   "n_clicks"),
-    State("store",        "data"),
-    prevent_initial_call=True,
+    Output("plan-img", "src"),
+    Input("store", "data"),
 )
-def update_rotation(m5, m1, reset, p1, p5, store):
-    store = store or {}
-    deg = float(store.get("plan_rotation", 0))
-    tid = ctx.triggered_id
-    if tid == "rot-m5-btn":    deg -= 5
-    elif tid == "rot-m1-btn":  deg -= 1
-    elif tid == "rot-reset-btn": deg = 0
-    elif tid == "rot-p1-btn":  deg += 1
-    elif tid == "rot-p5-btn":  deg += 5
-    deg = round(deg % 360, 1)
-    store["plan_rotation"] = deg
-    bmin = store.get("cloud_bmin")
-    bmax = store.get("cloud_bmax")
-    if bmin and bmax:
-        cache.add_gate({"gate_id": "_CLOUD_META_", "plan_rotation": deg,
-                        "cloud_bmin": bmin, "cloud_bmax": bmax})
-    return store, f"{deg}°"
+def init_plan_image(_store):
+    return _plan_src()
 
 
 # ---------------------------------------------------------------------------
-# Apply rotation from registry
+# View gate slice image
 # ---------------------------------------------------------------------------
 
 @callback(
-    Output("store",       "data",    allow_duplicate=True),
-    Output("rot-display", "children", allow_duplicate=True),
-    Input("apply-rot-btn", "n_clicks"),
-    State("store",         "data"),
+    Output("slice-img",    "src"),
+    Output("slice-title",  "children"),
+    Output("gate-nav-idx", "data"),
+    Input({"type": "view-gate-btn", "index": dash.ALL}, "n_clicks"),
     prevent_initial_call=True,
 )
-def apply_rotation_from_registry(_, store):
-    gates = cache.load_gates()
-    meta = next((g for g in gates if g.get("gate_id") == "_CLOUD_META_"), None)
-    if not meta:
-        return dash.no_update, dash.no_update
-    store = store or {}
-    deg = float(meta.get("plan_rotation", 0))
-    store["plan_rotation"] = deg
-    return store, f"{deg}°"
-
-
-# ---------------------------------------------------------------------------
-# Step buttons → update position input
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("pos-input", "value"),
-    Input("step-back10-btn", "n_clicks"),
-    Input("step-back-btn",   "n_clicks"),
-    Input("step-fwd-btn",    "n_clicks"),
-    Input("step-fwd10-btn",  "n_clicks"),
-    Input("plan-graph",      "clickData"),
-    State("pos-input",       "value"),
-    State("step-input",      "value"),
-    State("axis-radio",      "value"),
-    prevent_initial_call=True,
-)
-def update_position(b10, b1, f1, f10, click, pos, step, axis):
+def view_gate_slice(n_clicks_list):
     triggered = ctx.triggered_id
-    step = float(step or 0.5)
-    pos  = float(pos  or 0.0)
+    if not triggered or not any(n for n in n_clicks_list if n):
+        return dash.no_update, dash.no_update, dash.no_update
 
-    if triggered == "step-back10-btn": return round(pos - step * 10, 3)
-    if triggered == "step-back-btn":   return round(pos - step,      3)
-    if triggered == "step-fwd-btn":    return round(pos + step,      3)
-    if triggered == "step-fwd10-btn":  return round(pos + step * 10, 3)
+    gate_id = triggered["index"]
+    all_gates = cache.load_gates()
+    real_gates = [g for g in all_gates if g.get("gate_id") != "_CLOUD_META_"]
+    g = next((g for g in real_gates if g.get("gate_id") == gate_id), None)
+    if not g:
+        return "", f"Gate {gate_id} not found", 0
 
-    if triggered == "plan-graph" and click:
-        pt = click["points"][0]
-        # Coords are already in rotated space — use directly
-        return round(pt["y"] if (axis or "Y").upper() == "Y" else pt["x"], 2)
+    idx = next((i for i, rg in enumerate(real_gates) if rg.get("gate_id") == gate_id), 0)
 
-    return pos
+    img_fname = g.get("slice_image")
+    if not img_fname:
+        return "", f"{gate_id}  —  no slice image recorded", idx
 
+    images_dir = cache.get_images_dir()
+    if not images_dir:
+        return "", f"{gate_id}  —  import a gates JSON first", idx
 
-# ---------------------------------------------------------------------------
-# Slice update (Update Slice + Auto-Detect)
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("plan-graph",    "figure"),
-    Output("slice-graph",   "figure"),
-    Output("slice-title",   "children"),
-    Output("detect-status", "children"),
-    Output("gates-table",   "children",  allow_duplicate=True),
-    Input("slice-btn",      "n_clicks"),
-    Input("detect-btn",     "n_clicks"),
-    State("axis-radio",     "value"),
-    State("pos-input",      "value"),
-    State("thick-input",    "value"),
-    State("store",          "data"),
-    prevent_initial_call=True,
-)
-def update_slice(slice_clicks, detect_clicks, axis, pos, thick, store):
-    pts = cache.get_cloud()
-    if pts is None or len(pts) == 0:
-        msg = dbc.Alert("No cloud loaded. Use the Load bar above.", color="warning")
-        return _empty_plan(), _empty_slice(), "Cross-section", msg, dash.no_update
-
-    axis_up  = (axis or "Y").upper()
-    pos_m    = float(pos   or 0.0)
-    thick_m  = float(thick or 0.4)
-    rot_deg  = float((store or {}).get("plan_rotation", 0))
-
-    # For plan view subsample: rotate only the 75k display points
-    sub_idx = np.random.default_rng(0).choice(len(pts), min(75_000, len(pts)), replace=False, shuffle=False)
-    pts_sub = _rotate_pts(pts[sub_idx], rot_deg)
-    bn = cloud_bounds(_rotate_pts(pts[sub_idx], rot_deg))
-
-    # For slab: use fast mask on original coords, rotate only slab subset
-    triggered = ctx.triggered_id
-    mask = _slab_mask(pts, axis_up, pos_m, thick_m, rot_deg)
-    pts_slab_rot = _rotate_pts(pts[mask], rot_deg)
-    _, uv, u_label, v_label = extract_slab(pts_slab_rot, axis_up, pos_m, thick_m)
-    gates = cache.get_gates()
-
-    if triggered == "detect-btn":
-        if len(uv) < 20:
-            status = dbc.Alert(
-                f"Too few points in slab ({len(uv)}). Adjust position or increase thickness.",
-                color="warning")
-        else:
-            new_gates, debug_str = detect_gates(uv, axis_up, pos_m, thick_m, pts_slab_rot)
-            for g in new_gates:
-                cache.add_gate(g.to_dict())
-            gates = cache.get_gates()
-            status = dbc.Alert(
-                [f"Detected {len(new_gates)} gate(s) in slab  |  {len(uv):,} pts sampled.",
-                 html.Br(),
-                 html.Span(debug_str, className="text-muted small")],
-                color="success", className="py-1")
-    else:
-        status = f"{len(uv):,} pts in slab."
-
-    plan  = _plan_fig(pts_sub, axis_up, pos_m, bn, gates, rot_deg)
-    slc   = _slice_fig(uv, u_label, v_label, gates, pos_m)
-    title = (f"Cross-section  |  axis {axis_up}  @  {pos_m:.2f} m  "
-             f"|  thick {thick_m:.2f} m  |  {len(uv):,} pts  "
-             "(box-select to mark gate)")
-
-    return plan, slc, title, status, _build_table(gates)
-
-
-# ---------------------------------------------------------------------------
-# Auto-init plan view on page load
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("plan-graph",  "figure",  allow_duplicate=True),
-    Output("slice-graph", "figure",  allow_duplicate=True),
-    Output("pos-input",   "value",   allow_duplicate=True),
-    Input("store",        "data"),
-    State("pos-input",    "value"),
-    State("axis-radio",   "value"),
-    State("thick-input",  "value"),
-    prevent_initial_call="initial_duplicate",
-)
-def init_plan(store, pos, axis, thick):
-    pts = cache.get_cloud()
-    if pts is None or len(pts) == 0:
-        return _empty_plan(), _empty_slice(), dash.no_update
-
-    rot_deg = float((store or {}).get("plan_rotation", 0))
-    axis_up = (axis or "Y").upper()
-    thick_m = float(thick or 0.4)
-
-    # Rotate only the display subsample for the plan view
-    rng = np.random.default_rng(0)
-    sub_idx = rng.choice(len(pts), min(75_000, len(pts)), replace=False, shuffle=False)
-    pts_sub = _rotate_pts(pts[sub_idx], rot_deg)
-    bn = cloud_bounds(pts_sub)
-
-    if pos is None:
-        pos_m   = round((bn["ymin"] + bn["ymax"]) / 2, 2)
-        new_pos = pos_m
-    else:
-        pos_m   = float(pos)
-        new_pos = dash.no_update
-
-    gates = cache.get_gates()
-    plan  = _plan_fig(pts_sub, axis_up, pos_m, bn, gates, rot_deg)
-
-    # Rotate only the slab subset for the slice view
-    mask = _slab_mask(pts, axis_up, pos_m, thick_m, rot_deg)
-    pts_slab_rot = _rotate_pts(pts[mask], rot_deg)
-    _, uv, u_label, v_label = extract_slab(pts_slab_rot, axis_up, pos_m, thick_m)
-    slc = _slice_fig(uv, u_label, v_label, gates, pos_m)
-
-    return plan, slc, new_pos
-
-
-# ---------------------------------------------------------------------------
-# Capture box-select bbox from slice graph
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("selection-store", "data"),
-    Input("slice-graph",  "selectedData"),
-    State("axis-radio",   "value"),
-    State("pos-input",    "value"),
-    State("thick-input",  "value"),
-    prevent_initial_call=True,
-)
-def capture_selection(sel, axis, pos, thick):
-    if not sel or "range" not in sel:
-        return None
-    r = sel["range"]
-    u0, u1 = sorted(r["x"])
-    v0, v1 = sorted(r["y"])
-    return dict(
-        axis=axis or "Y",
-        position_m=float(pos   or 0),
-        thickness_m=float(thick or 0.4),
-        bbox_2d=[u0, v0, u1, v1],
-    )
-
-
-# ---------------------------------------------------------------------------
-# Add manual gate
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("gates-table",    "children",  allow_duplicate=True),
-    Output("detect-status",  "children",  allow_duplicate=True),
-    Input("add-gate-btn",    "n_clicks"),
-    State("selection-store", "data"),
-    State("gate-label-input","value"),
-    prevent_initial_call=True,
-)
-def add_manual_gate(n, sel, label):
-    if not sel:
-        return (dash.no_update,
-                dbc.Alert("Box-select a region in the slice view first.", color="warning"))
-    axis_up  = sel["axis"].upper()
-    pos_m    = sel["position_m"]
-    thick_m  = sel["thickness_m"]
-    bbox2    = sel["bbox_2d"]
-    u_idx = {"X": 1, "Y": 0}[axis_up]
-    ax_idx = {"X": 0, "Y": 1}[axis_up]
-
-    b3 = [0.0] * 6
-    b3[ax_idx]     = pos_m - thick_m / 2
-    b3[ax_idx + 3] = pos_m + thick_m / 2
-    b3[u_idx]      = bbox2[0]
-    b3[u_idx + 3]  = bbox2[2]
-    b3[2]          = bbox2[1]
-    b3[5]          = bbox2[3]
-
-    w = bbox2[2] - bbox2[0]
-    h = bbox2[3] - bbox2[1]
-    gid = f"GATE_{uuid.uuid4().hex[:6].upper()}"
-    g = dict(
-        gate_id=gid, axis=axis_up, position_m=pos_m, thickness_m=thick_m,
-        bbox_2d=bbox2, bbox_3d=b3, pipe_count=0, pipe_locs_2d=[],
-        opening_area_m2=w * h, confidence=1.0, source="manual",
-        label=label or "", notes="",
-    )
-    gates = cache.add_gate(g)
-    return (
-        _build_table(gates),
-        dbc.Alert(f"Manual gate added: {gid}", color="success", className="py-1"),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Clear all gates
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("gates-table",    "children",  allow_duplicate=True),
-    Output("detect-status",  "children",  allow_duplicate=True),
-    Input("clear-gates-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def clear_all_gates(_):
-    cache.clear_gates()
-    return _build_table([]), dbc.Alert("All gates cleared.", color="info", className="py-1")
-
-
-# ---------------------------------------------------------------------------
-# Refresh table
-# ---------------------------------------------------------------------------
-
-@callback(
-    Output("gates-table", "children", allow_duplicate=True),
-    Input("refresh-gates-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def refresh_gates(_):
-    return _build_table(cache.get_gates())
+    src = _img_src(images_dir / img_fname)
+    title = (f"[{idx+1}/{len(real_gates)}]  {gate_id}  |  axis {g.get('axis','?')}  "
+             f"@  {g.get('position_m',0):.2f} m  |  {g.get('pipe_count',0)} pipes  "
+             f"conf={g.get('confidence',0):.2f}")
+    return src, title, idx
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +250,21 @@ def delete_gate(n_clicks_list):
 
 
 # ---------------------------------------------------------------------------
+# Clear all gates
+# ---------------------------------------------------------------------------
+
+@callback(
+    Output("gates-table",   "children",  allow_duplicate=True),
+    Output("detect-status", "children",  allow_duplicate=True),
+    Input("clear-gates-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def clear_all_gates(_):
+    cache.clear_gates()
+    return _build_table([]), dbc.Alert("All gates cleared.", color="info", className="py-1")
+
+
+# ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
 
@@ -788,13 +283,13 @@ def export_gates(json_n, csv_n):
     triggered = ctx.triggered_id
 
     if triggered == "export-json-btn":
-        return dict(content=json.dumps(gates, indent=2), filename="gates.json"), \
-               f"Exported {len(gates)} gates as JSON."
+        return (dict(content=json.dumps(gates, indent=2), filename="gates.json"),
+                f"Exported {len(gates)} gates as JSON.")
 
     if triggered == "export-csv-btn":
         buf = io.StringIO()
-        keys = ["gate_id","axis","position_m","thickness_m","opening_area_m2",
-                "pipe_count","confidence","source","label","bbox_2d","bbox_3d","notes"]
+        keys = ["gate_id", "axis", "position_m", "thickness_m", "opening_area_m2",
+                "pipe_count", "confidence", "source", "label", "bbox_2d", "bbox_3d", "notes"]
         writer = csv.DictWriter(buf, fieldnames=keys, extrasaction="ignore")
         writer.writeheader()
         for g in gates:
@@ -802,8 +297,8 @@ def export_gates(json_n, csv_n):
             row["bbox_2d"] = json.dumps(g.get("bbox_2d", []))
             row["bbox_3d"] = json.dumps(g.get("bbox_3d", []))
             writer.writerow(row)
-        return dict(content=buf.getvalue(), filename="gates.csv"), \
-               f"Exported {len(gates)} gates as CSV."
+        return (dict(content=buf.getvalue(), filename="gates.csv"),
+                f"Exported {len(gates)} gates as CSV.")
 
     return dash.no_update, dash.no_update
 
@@ -815,6 +310,7 @@ def export_gates(json_n, csv_n):
 @callback(
     Output("gates-table",   "children",  allow_duplicate=True),
     Output("export-status", "children",  allow_duplicate=True),
+    Output("plan-img",      "src",       allow_duplicate=True),
     Input("import-gates-btn", "n_clicks"),
     prevent_initial_call=True,
 )
@@ -830,190 +326,91 @@ def import_gates(_):
     )
     root.destroy()
     if not path:
-        return dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update
 
     try:
         with open(path) as f:
             raw = json.load(f)
-        # Handle both AutoGateDetector format {"gates": [...]} and raw list
         gate_list = raw.get("gates", []) if isinstance(raw, dict) else raw
-        gate_list = [g for g in gate_list if "bbox_3d" in g]
+        # Keep _CLOUD_META_ and any gate with a bbox_3d
+        gate_list = [g for g in gate_list
+                     if g.get("gate_id") == "_CLOUD_META_" or "bbox_3d" in g]
         cache.save_gates(gate_list)
+
+        images_dir = Path(path).parent
+        cache.set_images_dir(images_dir)
+
+        plan_src = _plan_src()
+
+        n_real = sum(1 for g in gate_list if g.get("gate_id") != "_CLOUD_META_")
         return (
             _build_table(gate_list),
-            dbc.Alert(f"Imported {len(gate_list)} gates from {Path(path).name}",
+            dbc.Alert(f"Imported {n_real} gates from {Path(path).name}",
                       color="info", className="py-1"),
+            plan_src,
         )
     except Exception as e:
-        return dash.no_update, dbc.Alert(f"Import error: {e}", color="danger", className="py-1")
+        return dash.no_update, dbc.Alert(f"Import error: {e}", color="danger", className="py-1"), dash.no_update
 
 
 # ---------------------------------------------------------------------------
-# Load section callbacks (merged from load.py)
+# Arrow-key navigation
 # ---------------------------------------------------------------------------
 
-@callback(
-    Output("load-path-input", "value"),
-    Input("browse-btn", "n_clicks"),
-    prevent_initial_call=True,
+dash.clientside_callback(
+    """
+    function(n_intervals) {
+        if (!window._gd_kb_listener) {
+            window._gd_r = 0;
+            window._gd_l = 0;
+            document.addEventListener('keydown', function(e) {
+                if (e.key === 'ArrowRight') { window._gd_r++; e.preventDefault(); }
+                if (e.key === 'ArrowLeft')  { window._gd_l++; e.preventDefault(); }
+            });
+            window._gd_kb_listener = true;
+        }
+        return {r: window._gd_r, l: window._gd_l, t: n_intervals};
+    }
+    """,
+    Output("keyboard-store", "data"),
+    Input("key-poll", "n_intervals"),
 )
-def browse_file(_):
-    import tkinter as tk
-    from tkinter import filedialog
-    root = tk.Tk()
-    root.withdraw()
-    root.wm_attributes("-topmost", True)
-    path = filedialog.askopenfilename(
-        title="Select point cloud file",
-        filetypes=[
-            ("Point cloud files", "*.npy *.e57 *.pts *.xyz *.txt"),
-            ("All files", "*.*"),
-        ],
-    )
-    root.destroy()
-    return path or dash.no_update
 
 
 @callback(
-    Output("load-poll",        "disabled"),
-    Output("load-status",      "children", allow_duplicate=True),
-    Output("load-start-store", "data"),
-    Output("timer-interval",   "disabled"),
-    Input("load-btn",          "n_clicks"),
-    State("load-path-input",   "value"),
+    Output("slice-img",      "src",      allow_duplicate=True),
+    Output("slice-title",    "children", allow_duplicate=True),
+    Output("gate-nav-idx",   "data",     allow_duplicate=True),
+    Output("key-last-count", "data"),
+    Input("keyboard-store",  "data"),
+    State("gate-nav-idx",    "data"),
+    State("key-last-count",  "data"),
     prevent_initial_call=True,
 )
-def trigger_load(n_clicks, path):
-    if not path or not path.strip():
-        return True, dbc.Alert("Enter a file path first.", color="warning", className="py-1 mb-0"), dash.no_update, True
-    p = Path(path.strip())
-    if not p.exists():
-        return True, dbc.Alert(f"File not found: {p}", color="danger", className="py-1 mb-0"), dash.no_update, True
+def navigate_gate_keyboard(kb_data, nav_idx, last_kb):
+    if not kb_data or not last_kb:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    dr = kb_data.get("r", 0) - last_kb.get("r", 0)
+    dl = kb_data.get("l", 0) - last_kb.get("l", 0)
+    new_last = {"r": kb_data.get("r", 0), "l": kb_data.get("l", 0)}
+    if dr == 0 and dl == 0:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
-    def _load():
-        try:
-            cache.set_status("Starting load…", 0.0)
-            suffix = p.suffix.lower()
+    net = dr - dl
+    gates = [g for g in cache.load_gates() if g.get("gate_id") != "_CLOUD_META_"]
+    if not gates:
+        return dash.no_update, dash.no_update, nav_idx, new_last
 
-            if suffix == ".npy":
-                print(f"[Load] reading: {p} ({p.stat().st_size/1e9:.2f} GB)", flush=True)
-                cache.set_status(f"Reading {p.name}…", 0.1)
-                pts = np.load(str(p))
-                print(f"[Load] loaded: shape={pts.shape} dtype={pts.dtype}", flush=True)
-                if pts.ndim != 2 or pts.shape[1] < 3:
-                    cache.set_status("Error: .npy must be (N, ≥3) array.", 0.0)
-                    return
-                if pts.dtype != np.float32 or pts.shape[1] != 3:
-                    cache.set_status("Converting…", 0.8)
-                pts = pts[:, :3].astype(np.float32, copy=False)
-                cache.set_status("Caching…", 0.9)
-                cache.set_cloud(pts)
-                print("[Load] Done.", flush=True)
+    idx = (nav_idx + (1 if net > 0 else -1)) % len(gates)
+    g = gates[idx]
+    gate_id = g.get("gate_id", "")
+    img_fname = g.get("slice_image")
+    images_dir = cache.get_images_dir()
+    if not img_fname or not images_dir:
+        return "", f"[{idx+1}/{len(gates)}]  {gate_id} — no slice image", idx, new_last
 
-            elif suffix == ".e57":
-                try:
-                    import sys
-                    sys.path.insert(0, str(Path(__file__).parents[2] / "NeuralPipe-v2"))
-                    from neuralpipe.geometry.voxel_grid import downsample_to_npy
-                except ImportError:
-                    cache.set_status("Error: pye57 / NeuralPipe not found. Pre-downsample to .npy.", 0.0)
-                    return
-                out_npy = p.parent / (p.stem + "_15mm.npy")
-                pts = downsample_to_npy(p, out_npy, cell_size_m=0.015,
-                                        progress_callback=lambda m: cache.set_status(m, -1))
-                cache.set_cloud(pts)
-
-            elif suffix in (".pts", ".xyz", ".txt"):
-                try:
-                    import sys
-                    sys.path.insert(0, str(Path(__file__).parents[2] / "NeuralPipe-v2"))
-                    from neuralpipe.geometry.voxel_grid import downsample_to_npy
-                except ImportError:
-                    cache.set_status("Error: NeuralPipe not found. Pre-downsample to .npy.", 0.0)
-                    return
-                out_npy = p.parent / (p.stem + "_15mm.npy")
-                pts = downsample_to_npy(p, out_npy, cell_size_m=0.015,
-                                        progress_callback=lambda m: cache.set_status(m, -1))
-                cache.set_cloud(pts)
-
-            else:
-                cache.set_status(f"Unsupported format. Use: {_SUPPORTED}", 0.0)
-                return
-
-            n = len(cache.get_cloud())
-            cache.set_status(f"READY:{n}", 1.0)
-
-        except Exception as e:
-            cache.set_status(f"Error: {e}", 0.0)
-
-    threading.Thread(target=_load, daemon=True).start()
-    return False, html.Span("Loading…", className="text-info small"), time.time(), False
-
-
-@callback(
-    Output("load-poll",      "disabled",  allow_duplicate=True),
-    Output("load-status",    "children",  allow_duplicate=True),
-    Output("store",          "data",      allow_duplicate=True),
-    Output("timer-interval", "disabled",  allow_duplicate=True),
-    Output("load-timer-display", "children", allow_duplicate=True),
-    Input("load-poll",       "n_intervals"),
-    State("store",           "data"),
-    prevent_initial_call=True,
-)
-def poll_load(n, store):
-    msg, progress = cache.get_status()
-    print(f"[Poll] msg={msg!r} progress={progress}", flush=True)
-    store = store or {}
-
-    if not msg.startswith("READY:"):
-        return False, html.Span(msg or "Loading…", className="text-info small"), dash.no_update, dash.no_update, dash.no_update
-
-    try:
-        n_pts = int(msg.split(":", 1)[1])
-        pts = cache.get_cloud()
-        bn = cloud_bounds(pts) if pts is not None and len(pts) > 0 else {}
-        store.update(
-            cloud_bmin=[bn.get("xmin", 0), bn.get("ymin", 0), bn.get("zmin", 0)],
-            cloud_bmax=[bn.get("xmax", 0), bn.get("ymax", 0), bn.get("zmax", 0)],
-        )
-        status = dbc.Alert(
-            f"{n_pts:,} pts loaded.",
-            color="success", className="py-1 mb-0 small",
-        )
-        print(f"[Poll] READY — disabling interval, n_pts={n_pts:,}", flush=True)
-        return True, status, store, True, ""
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return True, dbc.Alert(f"Load error: {e}", color="danger", className="py-1 mb-0"), dash.no_update, True, ""
-
-
-@callback(
-    Output("load-status",        "children",  allow_duplicate=True),
-    Output("timer-interval",     "disabled",  allow_duplicate=True),
-    Output("load-timer-display", "children",  allow_duplicate=True),
-    Input("clear-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def clear_cloud(_):
-    cache.set_cloud(np.zeros((0, 3), dtype=np.float32))
-    cache.set_status("", 0.0)
-    return html.Span("Cloud cleared.", className="text-muted small"), True, ""
-
-
-@callback(
-    Output("load-timer-display", "children", allow_duplicate=True),
-    Output("load-timer-display", "style"),
-    Input("timer-interval",      "n_intervals"),
-    State("load-start-store",    "data"),
-    prevent_initial_call=True,
-)
-def update_timer(n, start_time):
-    if not start_time:
-        return "", {}
-    elapsed = time.time() - start_time
-    mins = int(elapsed // 60)
-    secs = int(elapsed % 60)
-    color = "#e74c3c" if elapsed > 180 else "#aaaaaa"
-    return f"{mins}:{secs:02d}", {"fontSize": "0.75rem", "color": color}
+    src = _img_src(images_dir / img_fname)
+    title = (f"[{idx+1}/{len(gates)}]  {gate_id}  |  axis {g.get('axis','?')}  "
+             f"@  {g.get('position_m', 0):.2f} m  |  {g.get('pipe_count', 0)} pipes  "
+             f"conf={g.get('confidence', 0):.2f}")
+    return src, title, idx, new_last

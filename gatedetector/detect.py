@@ -20,7 +20,179 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 import numpy as np
-from scipy.ndimage import binary_dilation, label, find_objects
+from scipy.ndimage import binary_dilation, binary_erosion, label, find_objects
+
+
+# ---------------------------------------------------------------------------
+# Pipe circle detection constants — standard pipe ODs (2" – 18")
+# ---------------------------------------------------------------------------
+
+# Outer diameters in metres for schedule pipe (ASME B36.10)
+_PIPE_ODS_M   = [0.0603, 0.0730, 0.0889, 0.1143, 0.1683, 0.2191, 0.2730,
+                 0.3239, 0.3556, 0.4064, 0.4572]
+_PIPE_SIZES_IN = [2,      2.5,    3,      4,      6,      8,      10,
+                  12,     14,     16,     18]
+
+_PIPE_MIN_R_M = _PIPE_ODS_M[0]  / 2   # 2"  → 30.2 mm radius
+_PIPE_MAX_R_M = _PIPE_ODS_M[-1] / 2   # 18" → 228.6 mm radius
+
+
+def _circle_from_3pts(p1, p2, p3):
+    """Circumcircle of 3 points. Returns (cx, cy, r) or None if collinear."""
+    ax, ay = float(p1[0]), float(p1[1])
+    bx, by = float(p2[0]), float(p2[1])
+    cx, cy = float(p3[0]), float(p3[1])
+    D = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(D) < 1e-12:
+        return None
+    ux = ((ax**2 + ay**2) * (by - cy) +
+          (bx**2 + by**2) * (cy - ay) +
+          (cx**2 + cy**2) * (ay - by)) / D
+    uy = ((ax**2 + ay**2) * (cx - bx) +
+          (bx**2 + by**2) * (ax - cx) +
+          (cx**2 + cy**2) * (bx - ax)) / D
+    r = float(np.sqrt((ax - ux)**2 + (ay - uy)**2))
+    return ux, uy, r
+
+
+def _arc_coverage_deg(pts_m: np.ndarray, cx: float, cy: float,
+                      r: float, tol_m: float) -> float:
+    """Return angular arc coverage (degrees) of pts_m inliers on circle (cx,cy,r).
+
+    Computed as 360° minus the largest angular gap between consecutive inlier
+    angles.  A full circle scores 360°; a short arc scores its angular span.
+    """
+    dists = np.sqrt((pts_m[:, 0] - cx) ** 2 + (pts_m[:, 1] - cy) ** 2)
+    mask = np.abs(dists - r) < tol_m
+    inliers = pts_m[mask]
+    if len(inliers) < 2:
+        return 0.0
+    angles = np.sort(np.arctan2(inliers[:, 1] - cy, inliers[:, 0] - cx))
+    gaps = np.diff(angles)
+    wrap_gap = float((angles[0] + 2 * np.pi) - angles[-1])
+    max_gap = float(max(gaps.max() if len(gaps) else 0.0, wrap_gap))
+    return float(np.degrees(max(0.0, 2 * np.pi - max_gap)))
+
+
+def _ransac_circle(pts_m: np.ndarray, n_iter: int = 100, tol_m: float = 0.025):
+    """RANSAC circle fit on 2D world-coord points.
+
+    Returns (cx, cy, r, inlier_frac) or None if fewer than 6 points.
+    """
+    n = len(pts_m)
+    if n < 6:
+        return None
+    rng = np.random.default_rng(0)
+    best_inliers = 0
+    best = None
+    for _ in range(n_iter):
+        idx = rng.choice(n, 3, replace=False)
+        res = _circle_from_3pts(pts_m[idx[0]], pts_m[idx[1]], pts_m[idx[2]])
+        if res is None:
+            continue
+        cx, cy, r = res
+        dists = np.sqrt((pts_m[:, 0] - cx) ** 2 + (pts_m[:, 1] - cy) ** 2)
+        inliers = int((np.abs(dists - r) < tol_m).sum())
+        if inliers > best_inliers:
+            best_inliers = inliers
+            best = (cx, cy, r, inliers / n)
+    return best
+
+
+def _nearest_pipe_size(diameter_m: float):
+    """Return (nominal_in, od_m) of the closest standard pipe size."""
+    idx = int(np.argmin([abs(diameter_m - od) for od in _PIPE_ODS_M]))
+    return _PIPE_SIZES_IN[idx], _PIPE_ODS_M[idx]
+
+
+def detect_pipe_circles(
+    uv: np.ndarray,
+    cell_m: float = 0.030,
+    min_r_m: float = _PIPE_MIN_R_M,
+    max_r_m: float = _PIPE_MAX_R_M,
+    min_inlier_frac: float = 0.25,
+    min_arc_deg: float = 90.0,
+    n_ransac: int = 100,
+) -> list[dict]:
+    """Detect pipe cross-sections in a 2D slice using RANSAC circle fitting.
+
+    Works on connected components from a lightly rasterised grid. Each component
+    whose fitted circle radius falls within [min_r_m, max_r_m] and achieves
+    sufficient inlier fraction is recorded as a detected pipe.
+
+    Returns list of dicts:
+        u_m, v_m          — circle centre in world metres (U=horizontal, V=Z)
+        radius_m          — fitted radius
+        diameter_m        — fitted diameter
+        nominal_in        — nearest standard nominal pipe size in inches
+        nominal_od_m      — standard OD for that size
+        inlier_frac       — RANSAC inlier fraction (fit quality, 0–1)
+    """
+    if len(uv) < 5:
+        return []
+
+    struct = np.ones((3, 3), dtype=bool)
+
+    # Rasterize with minimal dilation so components stay separate
+    u_min, v_min = uv.min(axis=0)
+    u_max, v_max = uv.max(axis=0)
+    border = cell_m * 2
+    u0 = u_min - border
+    v0 = v_min - border
+    n_u = max(1, int(np.ceil((u_max - u_min + 2 * border) / cell_m)))
+    n_v = max(1, int(np.ceil((v_max - v_min + 2 * border) / cell_m)))
+    ui = np.clip(((uv[:, 0] - u0) / cell_m).astype(int), 0, n_u - 1)
+    vi = np.clip(((uv[:, 1] - v0) / cell_m).astype(int), 0, n_v - 1)
+    raw_grid = np.zeros((n_v, n_u), dtype=bool)
+    raw_grid[vi, ui] = True
+    dilated = binary_dilation(raw_grid, structure=struct, iterations=1)
+
+    labeled_grid, n_comp = label(dilated)
+    slices = find_objects(labeled_grid)
+
+    results = []
+    for comp_idx, sl in enumerate(slices):
+        comp_mask = labeled_grid[sl] == (comp_idx + 1)
+
+        # Boundary pixels only — ring arc, not filled blob
+        eroded = binary_erosion(comp_mask, structure=struct)
+        boundary = comp_mask & ~eroded
+        brows, bcols = np.where(boundary)
+        if len(brows) < 6:
+            continue
+
+        v_offset = sl[0].start
+        u_offset = sl[1].start
+        pts_m = np.column_stack([
+            u0 + (bcols + u_offset + 0.5) * cell_m,
+            v0 + (brows + v_offset + 0.5) * cell_m,
+        ])
+
+        fit = _ransac_circle(pts_m, n_iter=n_ransac, tol_m=cell_m * 1.5)
+        if fit is None:
+            continue
+        cx, cy, r, inlier_frac = fit
+
+        if not (min_r_m <= r <= max_r_m):
+            continue
+        if inlier_frac < min_inlier_frac:
+            continue
+        arc_deg = _arc_coverage_deg(pts_m, cx, cy, r, cell_m * 1.5)
+        if arc_deg < min_arc_deg:
+            continue
+
+        nom_in, nom_od = _nearest_pipe_size(r * 2)
+        results.append({
+            "u_m":        float(cx),
+            "v_m":        float(cy),
+            "radius_m":   float(r),
+            "diameter_m": float(r * 2),
+            "nominal_in": nom_in,
+            "nominal_od_m": float(nom_od),
+            "inlier_frac": float(inlier_frac),
+        })
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +295,7 @@ def _find_h_bands(
     grid: np.ndarray,
     min_run_cells: int = 10,
     merge_row_gap: int = 4,
-    prominence_frac: float = 0.01,
+    prominence_frac: float = 0.005,
 ) -> list[dict]:
     """Find horizontal beam bands using local density peak detection.
 
@@ -131,6 +303,10 @@ def _find_h_bands(
     Works in dense cross-sections where global fill-fraction thresholds fail:
     a structural beam creates a row-density spike even when the gate interior
     is full of pipes.
+
+    prominence_frac=0.005 (0.5% of n_cols) is intentionally permissive so
+    beams in pipe-dense sections are not missed.  The gate size filters
+    downstream handle any spurious candidates.
 
     Returns list of dicts: {row_min, row_max, col_min, col_max}
     """
@@ -170,7 +346,7 @@ def _find_v_bands(
     grid: np.ndarray,
     min_run_cells: int = 10,
     merge_col_gap: int = 4,
-    prominence_frac: float = 0.01,
+    prominence_frac: float = 0.005,
 ) -> list[dict]:
     """Find vertical beam bands (same logic transposed).
 
@@ -446,9 +622,9 @@ def detect_gates(
     pts3d: np.ndarray,
     cell_m: float = 0.030,
     min_gate_w: float = 0.3,
-    max_gate_w: float = 8.0,
+    max_gate_w: float = 15.0,
     min_gate_h: float = 0.3,
-    max_gate_h: float = 6.0,
+    max_gate_h: float = 8.0,
     min_beam_fill: float = 0.20,   # retained in signature for compatibility, unused in v2
 ) -> tuple[list[Gate], str]:
     """Detect pipe rack gates in a 2D cross-section slice (v2 algorithm).
