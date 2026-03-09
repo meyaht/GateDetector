@@ -628,6 +628,7 @@ def detect_gates(
     min_gate_h: float = 0.3,
     max_gate_h: float = 8.0,
     min_beam_fill: float = 0.20,   # retained in signature for compatibility, unused in v2
+    verbose: bool = False,
 ) -> tuple[list[Gate], str]:
     """Detect pipe rack gates in a 2D cross-section slice (v2 algorithm).
 
@@ -715,5 +716,6 @@ def detect_gates(
         f"(grid {grid.shape[1]}×{grid.shape[0]} cells, "
         f"size limits W {min_gate_w}–{max_gate_w} m, H {min_gate_h}–{max_gate_h} m)"
     )
-    print(f"[Detect] {debug_str}", flush=True)
+    if verbose:
+        print(f"[Detect] {debug_str}", flush=True)
     return gates, debug_str
