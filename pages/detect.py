@@ -216,19 +216,21 @@ def _build_table(gates: list[dict]) -> html.Div:
     real_gates = [g for g in gates if g.get("gate_id") != "_CLOUD_META_"]
 
     parts = []
-    if meta:
-        rot  = meta.get("plan_rotation", 0)
-        bmin = meta.get("cloud_bmin")
-        bmax = meta.get("cloud_bmax")
-        bounds = ""
-        if bmin and bmax:
-            bounds = (f"   X {bmin[0]:.1f}–{bmax[0]:.1f}  "
-                      f"Y {bmin[1]:.1f}–{bmax[1]:.1f}  "
-                      f"Z {bmin[2]:.1f}–{bmax[2]:.1f} m")
-        parts.append(dbc.Alert(
-            f"Saved rotation: {rot}°{bounds}",
-            color="dark", className="py-1 mb-2 small font-monospace",
-        ))
+
+    # File + rotation header banner
+    fname = cache.GATES_FILE.name
+    rot = float(meta.get("plan_rotation", 0)) if meta else 0.0
+    bmin = meta.get("cloud_bmin") if meta else None
+    bmax = meta.get("cloud_bmax") if meta else None
+    bounds = ""
+    if bmin and bmax:
+        bounds = (f"   X {bmin[0]:.1f}–{bmax[0]:.1f}  "
+                  f"Y {bmin[1]:.1f}–{bmax[1]:.1f}  "
+                  f"Z {bmin[2]:.1f}–{bmax[2]:.1f} m")
+    parts.append(dbc.Alert(
+        f"{fname}   |   rotation: {rot}°{bounds}",
+        color="dark", className="py-1 mb-2 small font-monospace",
+    ))
 
     if not real_gates:
         parts.append(dbc.Alert("No gates registered yet.", color="secondary", className="small py-1"))
