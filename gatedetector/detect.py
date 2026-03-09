@@ -110,8 +110,8 @@ def detect_pipe_circles(
     cell_m: float = 0.030,
     min_r_m: float = _PIPE_MIN_R_M,
     max_r_m: float = _PIPE_MAX_R_M,
-    min_inlier_frac: float = 0.25,
-    min_arc_deg: float = 90.0,
+    min_inlier_frac: float = 0.40,
+    min_arc_deg: float = 150.0,
     n_ransac: int = 100,
 ) -> list[dict]:
     """Detect pipe cross-sections in a 2D slice using RANSAC circle fitting.
@@ -420,8 +420,10 @@ def _find_gate_rects_v2(
             if not (min_gate_w_cells <= gate_w_cells <= max_gate_w_cells):
                 continue
 
-            v0_c = bot['row_max']
-            v1_c = top['row_min']
+            # Extend inward a few cells so pipe rings at the beam edge are
+            # included in the gate bbox (peak row != beam outer edge).
+            v0_c = max(0, bot['row_max'] - 3)
+            v1_c = top['row_min'] + 3
 
             # Find best matching left and right vertical bands
             left_v = None
