@@ -110,9 +110,9 @@ def detect_pipe_circles(
     cell_m: float = 0.030,
     min_r_m: float = _PIPE_MIN_R_M,
     max_r_m: float = _PIPE_MAX_R_M,
-    min_inlier_frac: float = 0.40,
-    min_arc_deg: float = 150.0,
-    n_ransac: int = 100,
+    min_inlier_frac: float = 0.55,
+    min_arc_deg: float = 180.0,
+    n_ransac: int = 150,
 ) -> list[dict]:
     """Detect pipe cross-sections in a 2D slice using RANSAC circle fitting.
 

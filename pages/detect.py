@@ -137,9 +137,18 @@ layout = dbc.Container(fluid=True, children=[
         ], md=5),
 
         dbc.Col([
-            html.H6(id="slice-title",
-                    children="Click ⬜ on a gate row to view its slice image",
-                    className="text-muted mb-1 small"),
+            dbc.Row([
+                dbc.Col(dbc.Button("◀", id="nav-prev-btn", n_clicks=0,
+                                   color="secondary", outline=True, size="sm",
+                                   title="Previous gate  (←)"), width="auto"),
+                dbc.Col(html.H6(id="slice-title",
+                                children="Click ⬜ on a gate row to view its slice image",
+                                className="text-muted mb-0 small"),
+                        className="align-self-center"),
+                dbc.Col(dbc.Button("▶", id="nav-next-btn", n_clicks=0,
+                                   color="secondary", outline=True, size="sm",
+                                   title="Next gate  (→)"), width="auto"),
+            ], className="mb-1 align-items-center g-2"),
             html.Img(
                 id="slice-img",
                 style={"width": "100%", "maxHeight": "48vh",
@@ -152,11 +161,7 @@ layout = dbc.Container(fluid=True, children=[
     # ---- Status line -----------------------------------------------------
     html.Div(id="detect-status", className="small text-info mb-2"),
 
-    # ---- Gate registry ---------------------------------------------------
-    html.H6("Gate Registry", className="mb-1"),
-    html.Div(id="gates-table", children=_build_table(cache.load_gates()), className="mb-3"),
-
-    # ---- Import / Export -------------------------------------------------
+    # ---- Import / Export / Clear (above table) ---------------------------
     dbc.Row([
         dbc.Col(dbc.Button("Import Gates JSON…", id="import-gates-btn",
                            color="info", outline=True, size="sm"), width="auto"),
@@ -167,15 +172,17 @@ layout = dbc.Container(fluid=True, children=[
         dbc.Col(dbc.Button("Clear All Gates", id="clear-gates-btn",
                            color="danger", outline=True, size="sm"), width="auto"),
         dbc.Col(html.Div(id="export-status", className="small text-info")),
-    ], className="g-2 align-items-center mb-4"),
+    ], className="g-2 align-items-center mb-2"),
+
+    # ---- Gate registry ---------------------------------------------------
+    html.H6("Gate Registry", className="mb-1"),
+    html.Div(id="gates-table", children=_build_table(cache.load_gates()), className="mb-3"),
 
     dcc.Download(id="gates-dl"),
 
-    # Arrow-key navigation state
-    dcc.Store(id="keyboard-store",  data={"r": 0, "l": 0, "t": 0}),
-    dcc.Store(id="gate-nav-idx",    data=0),
-    dcc.Store(id="key-last-count",  data={"r": 0, "l": 0}),
-    dcc.Interval(id="key-poll", interval=150, n_intervals=0),
+    # Navigation state + dummy store for one-shot key listener setup
+    dcc.Store(id="gate-nav-idx",  data=0),
+    dcc.Store(id="kb-init-dummy", data=None),
 ])
 
 
@@ -192,7 +199,41 @@ def init_plan_image(_store):
 
 
 # ---------------------------------------------------------------------------
-# View gate slice image
+# Helpers for slice-based navigation
+# ---------------------------------------------------------------------------
+
+def _unique_slice_list(real_gates: list) -> list[dict]:
+    """Return ordered list of unique slices (one entry per distinct slice_image).
+
+    Each entry: {"fname": str, "axis": str, "position_m": float, "gates": [...]}.
+    """
+    seen: dict[str, dict] = {}
+    for g in real_gates:
+        fname = g.get("slice_image")
+        if not fname:
+            continue
+        if fname not in seen:
+            seen[fname] = {
+                "fname":      fname,
+                "axis":       g.get("axis", "?"),
+                "position_m": g.get("position_m", 0),
+                "gates":      [],
+            }
+        seen[fname]["gates"].append(g)
+    return list(seen.values())
+
+
+def _slice_title(sl: dict, idx: int, total: int) -> str:
+    gate_ids = "  ".join(g["gate_id"] for g in sl["gates"])
+    pipes    = sum(g.get("pipe_count", 0) for g in sl["gates"])
+    conf     = max((g.get("confidence", 0) for g in sl["gates"]), default=0)
+    return (f"[{idx+1}/{total}]  {sl['axis']}={sl['position_m']:.2f} m  "
+            f"|  {len(sl['gates'])} gate(s)  {pipes} pipes  conf={conf:.2f}  "
+            f"|  {gate_ids}")
+
+
+# ---------------------------------------------------------------------------
+# View gate slice image (⬜ button — jumps to that slice)
 # ---------------------------------------------------------------------------
 
 @callback(
@@ -208,27 +249,21 @@ def view_gate_slice(n_clicks_list):
         return dash.no_update, dash.no_update, dash.no_update
 
     gate_id = triggered["index"]
-    all_gates = cache.load_gates()
-    real_gates = [g for g in all_gates if g.get("gate_id") != "_CLOUD_META_"]
+    real_gates = [g for g in cache.load_gates() if g.get("gate_id") != "_CLOUD_META_"]
     g = next((g for g in real_gates if g.get("gate_id") == gate_id), None)
     if not g:
         return "", f"Gate {gate_id} not found", 0
 
-    idx = next((i for i, rg in enumerate(real_gates) if rg.get("gate_id") == gate_id), 0)
-
     img_fname = g.get("slice_image")
-    if not img_fname:
-        return "", f"{gate_id}  —  no slice image recorded", idx
-
     images_dir = cache.get_images_dir()
-    if not images_dir:
-        return "", f"{gate_id}  —  import a gates JSON first", idx
+    if not img_fname or not images_dir:
+        return "", f"{gate_id}  —  no slice image", 0
+
+    slices = _unique_slice_list(real_gates)
+    idx = next((i for i, sl in enumerate(slices) if sl["fname"] == img_fname), 0)
 
     src = _img_src(images_dir / img_fname)
-    title = (f"[{idx+1}/{len(real_gates)}]  {gate_id}  |  axis {g.get('axis','?')}  "
-             f"@  {g.get('position_m',0):.2f} m  |  {g.get('pipe_count',0)} pipes  "
-             f"conf={g.get('confidence',0):.2f}")
-    return src, title, idx
+    return src, _slice_title(slices[idx], idx, len(slices)), idx
 
 
 # ---------------------------------------------------------------------------
@@ -354,63 +389,53 @@ def import_gates(_):
 
 
 # ---------------------------------------------------------------------------
-# Arrow-key navigation
+# Arrow-key navigation — bind keys to ◀/▶ buttons (fires once on page load)
 # ---------------------------------------------------------------------------
 
 dash.clientside_callback(
     """
-    function(n_intervals) {
+    function(_store) {
         if (!window._gd_kb_listener) {
-            window._gd_r = 0;
-            window._gd_l = 0;
             document.addEventListener('keydown', function(e) {
-                if (e.key === 'ArrowRight') { window._gd_r++; e.preventDefault(); }
-                if (e.key === 'ArrowLeft')  { window._gd_l++; e.preventDefault(); }
+                var btn;
+                if (e.key === 'ArrowRight') {
+                    btn = document.getElementById('nav-next-btn');
+                } else if (e.key === 'ArrowLeft') {
+                    btn = document.getElementById('nav-prev-btn');
+                }
+                if (btn) { btn.click(); e.preventDefault(); }
             });
             window._gd_kb_listener = true;
         }
-        return {r: window._gd_r, l: window._gd_l, t: n_intervals};
+        return null;
     }
     """,
-    Output("keyboard-store", "data"),
-    Input("key-poll", "n_intervals"),
+    Output("kb-init-dummy", "data"),
+    Input("store", "data"),
 )
 
 
 @callback(
-    Output("slice-img",      "src",      allow_duplicate=True),
-    Output("slice-title",    "children", allow_duplicate=True),
-    Output("gate-nav-idx",   "data",     allow_duplicate=True),
-    Output("key-last-count", "data"),
-    Input("keyboard-store",  "data"),
-    State("gate-nav-idx",    "data"),
-    State("key-last-count",  "data"),
+    Output("slice-img",    "src",      allow_duplicate=True),
+    Output("slice-title",  "children", allow_duplicate=True),
+    Output("gate-nav-idx", "data",     allow_duplicate=True),
+    Input("nav-prev-btn",  "n_clicks"),
+    Input("nav-next-btn",  "n_clicks"),
+    State("gate-nav-idx",  "data"),
     prevent_initial_call=True,
 )
-def navigate_gate_keyboard(kb_data, nav_idx, last_kb):
-    if not kb_data or not last_kb:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
-    dr = kb_data.get("r", 0) - last_kb.get("r", 0)
-    dl = kb_data.get("l", 0) - last_kb.get("l", 0)
-    new_last = {"r": kb_data.get("r", 0), "l": kb_data.get("l", 0)}
-    if dr == 0 and dl == 0:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+def navigate_gate(_prev, _next, nav_idx):
+    direction = 1 if ctx.triggered_id == "nav-next-btn" else -1
+    real_gates = [g for g in cache.load_gates() if g.get("gate_id") != "_CLOUD_META_"]
+    slices = _unique_slice_list(real_gates)
+    if not slices:
+        return dash.no_update, dash.no_update, nav_idx
 
-    net = dr - dl
-    gates = [g for g in cache.load_gates() if g.get("gate_id") != "_CLOUD_META_"]
-    if not gates:
-        return dash.no_update, dash.no_update, nav_idx, new_last
-
-    idx = (nav_idx + (1 if net > 0 else -1)) % len(gates)
-    g = gates[idx]
-    gate_id = g.get("gate_id", "")
-    img_fname = g.get("slice_image")
+    idx = (nav_idx + direction) % len(slices)
+    sl = slices[idx]
     images_dir = cache.get_images_dir()
-    if not img_fname or not images_dir:
-        return "", f"[{idx+1}/{len(gates)}]  {gate_id} — no slice image", idx, new_last
+    if not images_dir:
+        return "", _slice_title(sl, idx, len(slices)), idx
 
-    src = _img_src(images_dir / img_fname)
-    title = (f"[{idx+1}/{len(gates)}]  {gate_id}  |  axis {g.get('axis','?')}  "
-             f"@  {g.get('position_m', 0):.2f} m  |  {g.get('pipe_count', 0)} pipes  "
-             f"conf={g.get('confidence', 0):.2f}")
-    return src, title, idx, new_last
+    src = _img_src(images_dir / sl["fname"])
+    return src, _slice_title(sl, idx, len(slices)), idx
