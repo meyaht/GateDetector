@@ -105,7 +105,7 @@ def _slab_mask(pts: np.ndarray, axis: str, position_m: float,
 
 
 def _plan_fig(pts: np.ndarray, axis: str, position_m: float,
-              bn: dict, gates: list[dict]) -> go.Figure:
+              bn: dict, gates: list[dict], rot_deg: float = 0.0) -> go.Figure:
     """pts should already be rotated before calling."""
     x, y = plan_projection(pts, n_max=75_000)
 
@@ -128,14 +128,24 @@ def _plan_fig(pts: np.ndarray, axis: str, position_m: float,
                       y0=bn["ymin"], y1=bn["ymax"],
                       line=dict(color="#e74c3c", width=2, dash="dash"))
 
+    # Rotate gate bbox corners to match the rotated plan view
+    r = np.deg2rad(rot_deg)
+    rc, rs = np.cos(r), np.sin(r)
     for g in gates:
         b3 = g.get("bbox_3d", [])
         if len(b3) != 6:
             continue
-        fig.add_shape(type="rect",
-                      x0=b3[0], x1=b3[3], y0=b3[1], y1=b3[4],
-                      line=dict(color="#f39c12", width=1),
-                      fillcolor="rgba(243,156,18,0.1)")
+        x0, y0, _, x1, y1, _ = b3
+        # Four corners of the XY footprint
+        corners = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]])
+        cx = corners[:, 0] * rc - corners[:, 1] * rs
+        cy = corners[:, 0] * rs + corners[:, 1] * rc
+        fig.add_trace(go.Scatter(
+            x=cx.tolist(), y=cy.tolist(), mode="lines",
+            line=dict(color="#f39c12", width=1),
+            fill="toself", fillcolor="rgba(243,156,18,0.1)",
+            hoverinfo="skip", showlegend=False,
+        ))
 
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
@@ -581,7 +591,7 @@ def update_slice(slice_clicks, detect_clicks, axis, pos, thick, store):
     else:
         status = f"{len(uv):,} pts in slab."
 
-    plan  = _plan_fig(pts_sub, axis_up, pos_m, bn, gates)
+    plan  = _plan_fig(pts_sub, axis_up, pos_m, bn, gates, rot_deg)
     slc   = _slice_fig(uv, u_label, v_label, gates, pos_m)
     title = (f"Cross-section  |  axis {axis_up}  @  {pos_m:.2f} m  "
              f"|  thick {thick_m:.2f} m  |  {len(uv):,} pts  "
@@ -627,7 +637,7 @@ def init_plan(store, pos, axis, thick):
         new_pos = dash.no_update
 
     gates = cache.get_gates()
-    plan  = _plan_fig(pts_sub, axis_up, pos_m, bn, gates)
+    plan  = _plan_fig(pts_sub, axis_up, pos_m, bn, gates, rot_deg)
 
     # Rotate only the slab subset for the slice view
     mask = _slab_mask(pts, axis_up, pos_m, thick_m, rot_deg)
