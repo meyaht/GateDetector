@@ -628,6 +628,7 @@ def detect_gates(
     min_gate_h: float = 0.3,
     max_gate_h: float = 8.0,
     min_beam_fill: float = 0.20,   # retained in signature for compatibility, unused in v2
+    min_beam_span_frac: float = 0.50,
     verbose: bool = False,
 ) -> tuple[list[Gate], str]:
     """Detect pipe rack gates in a 2D cross-section slice (v2 algorithm).
@@ -649,8 +650,17 @@ def detect_gates(
     h_bands = _find_h_bands(grid, min_run_cells=10, merge_row_gap=4)
     v_bands = _find_v_bands(grid, min_run_cells=10, merge_col_gap=4)
 
+    # Discard h-bands whose horizontal extent is less than min_beam_span_frac of
+    # the grid width.  Real structural beams span the full rack; cross-bracing
+    # only intersects the slice plane at a short diagonal segment (typically
+    # < 5% of grid width) and must not be mistaken for a load-bearing beam.
+    n_cols = grid.shape[1]
+    min_span_cells = int(n_cols * min_beam_span_frac)
+    h_bands = [b for b in h_bands
+               if (b["col_max"] - b["col_min"]) >= min_span_cells]
+
     if not h_bands:
-        return [], f"0 h-bands found (grid {grid.shape[1]}×{grid.shape[0]} cells)."
+        return [], f"0 h-bands found after span filter (grid {grid.shape[1]}×{grid.shape[0]} cells)."
 
     rects = _find_gate_rects_v2(
         h_bands, v_bands, cell_m,
