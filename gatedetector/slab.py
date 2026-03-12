@@ -37,10 +37,26 @@ def extract_slab(
     ax = _AXIS[axis]
     u_idx, v_idx, u_label, v_label = _PROJ[axis]
 
-    half = thickness_m / 2.0
-    coord = pts[:, ax]
-    mask = (coord >= position_m - half) & (coord <= position_m + half)
-    pts_slab = pts[mask]
+    half  = thickness_m / 2.0
+    lo    = position_m - half
+    hi    = position_m + half
+
+    # Chunked masking — avoids allocating a full-length bool array for large clouds
+    CHUNK = 50_000_000
+    if len(pts) <= CHUNK:
+        coord = pts[:, ax]
+        mask  = (coord >= lo) & (coord <= hi)
+        pts_slab = pts[mask]
+    else:
+        parts = []
+        for start in range(0, len(pts), CHUNK):
+            chunk    = pts[start:start + CHUNK]
+            chunk_ok = (chunk[:, ax] >= lo) & (chunk[:, ax] <= hi)
+            idx      = np.where(chunk_ok)[0]
+            if len(idx):
+                parts.append(chunk[idx])
+        pts_slab = np.concatenate(parts) if parts else pts[:0]
+
     uv = pts_slab[:, [u_idx, v_idx]]
     return pts_slab, uv, u_label, v_label
 
